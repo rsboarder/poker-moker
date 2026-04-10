@@ -11,7 +11,8 @@ from equity import (
     get_opponent_range,
 )
 from hand_tiers import get_hand_tier, get_position_adjusted_tier, get_preflop_action, is_premium, is_trash
-from llm_engine import build_prompt, call_llm
+from bet_sizing import geometric_bet_size, calculate_spr, get_spr_category, spr_adjust_action
+from llm_engine import build_prompt, call_llm, check_reasoning_action_consistency
 from opponent_tracker import OpponentTracker
 from storage import GameStorage
 
@@ -86,10 +87,17 @@ def make_decision(
     pot_odds = calculate_pot_odds(to_call, pot)
     eq_cat = categorize_equity(eq)
 
+    # ── SPR + geometric sizing context ───────────────────────
+    spr = calculate_spr(stack, pot)
+    streets_map = {"preflop": 3, "flop": 2, "turn": 1, "river": 0}
+    streets_remaining = streets_map.get(street, 1)
+    geo_size = geometric_bet_size(pot, stack, streets_remaining) if streets_remaining > 0 else 0
+
     logger.info(
         "Strategy input — tier=%d adj_tier=%d equity=%.1f%% pot_odds=%.1f%% "
-        "to_call=%d can_check=%s street=%s",
+        "to_call=%d can_check=%s street=%s spr=%.1f geo=%d",
         hand_tier, adj_tier, eq * 100, pot_odds * 100, to_call, can_check, street,
+        spr, geo_size,
     )
 
     # ── Layer 1: Preflop charts (instant) ──────────────────────
@@ -126,15 +134,17 @@ def make_decision(
     checked_to_us = to_call == 0 and can_raise
 
     if action is None and eq >= EQUITY_STRONG and can_raise and min_raise:
-        # Very strong — always raise regardless of situation
-        raise_amt = min(int(pot * 0.75), stack)
+        # Very strong — raise with geometric sizing
+        raise_amt = geo_size if geo_size >= min_raise else min(int(pot * 0.75), stack)
         raise_amt = max(raise_amt, min_raise)
+        raise_amt = min(raise_amt, stack)
         action = f"raise {raise_amt}"
         source = "equity"
     elif action is None and checked_to_us and eq >= EQUITY_GOOD and min_raise:
-        # Checked to us with good hand — value bet (council fix D)
-        raise_amt = min(int(pot * 0.5), stack)
+        # Checked to us with good hand — value bet with geometric sizing
+        raise_amt = geo_size if geo_size >= min_raise else min(int(pot * 0.5), stack)
         raise_amt = max(raise_amt, min_raise)
+        raise_amt = min(raise_amt, stack)
         action = f"raise {raise_amt}"
         source = "equity"
     elif action is None and eq < EQUITY_TRASH and to_call > 0:
@@ -206,8 +216,14 @@ def make_decision(
             else:
                 action = "fold"
             source = "equity_fallback"
+        else:
+            # Knowing-doing gap fix: check if reasoning contradicts action
+            action = check_reasoning_action_consistency(reasoning, action, eq, pot_odds)
 
     elapsed_ms = (time.perf_counter() - start) * 1000
+
+    # ── SPR adjustment ───────────────────────────────────────
+    action = spr_adjust_action(action, eq, spr, can_raise, min_raise)
 
     # ── Validate action against valid_line ────────────────────
     action = _validate_action(action, valid_line, can_check, to_call, min_raise, stack)

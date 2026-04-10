@@ -134,6 +134,53 @@ def parse_llm_response(raw: str) -> tuple[str, str | None]:
     return "fold", reasoning
 
 
+# ── Knowing-doing gap fix ────────────────────────────────────────────────────
+
+RE_PROFITABLE = re.compile(
+    r"(profitable|positive.*(?:ev|expected value)|equity.*(?:exceed|above|greater|>).*(?:pot odds|odds))",
+    re.IGNORECASE,
+)
+RE_SHOULD_CALL = re.compile(
+    r"(should call|i should call|calling is|call is.*profitable|must call)",
+    re.IGNORECASE,
+)
+
+
+def check_reasoning_action_consistency(
+    reasoning: str | None,
+    action: str,
+    equity: float,
+    pot_odds: float,
+) -> str:
+    """Fix knowing-doing gap: if reasoning says profitable but action is fold, override.
+
+    Only overrides fold→call when BOTH:
+    1. Reasoning text indicates profitability
+    2. Math confirms equity > pot_odds
+    """
+    if not reasoning:
+        return action
+
+    if action != "fold":
+        return action
+
+    # Check if reasoning says it's profitable
+    reasoning_says_profitable = bool(
+        RE_PROFITABLE.search(reasoning) or RE_SHOULD_CALL.search(reasoning)
+    )
+
+    math_says_call = equity > pot_odds + 0.05
+
+    if reasoning_says_profitable and math_says_call:
+        logger.warning(
+            "Knowing-doing fix: LLM said fold but reasoning + math say call "
+            "(eq=%.1f%% > odds=%.1f%%)", equity * 100, pot_odds * 100
+        )
+        return "call"
+
+    return action
+
+
 # ── API backend ──────────────────────────────────────────────────────────────
 
 def _call_api(prompt: str) -> tuple[str, float]:
