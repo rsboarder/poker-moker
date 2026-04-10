@@ -1,0 +1,14 @@
+# Secrets
+.env
+agent/.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Game data (regenerated each tournament)
+data/
+logs/
+
+# OS
+.DS_Store
