@@ -12,6 +12,9 @@ from equity import (
 )
 from hand_tiers import get_hand_tier, get_position_adjusted_tier, get_preflop_action, is_premium, is_trash
 from bet_sizing import geometric_bet_size, calculate_spr, get_spr_category, spr_adjust_action
+from board_texture import classify_board, texture_bet_multiplier
+from confidence import get_confidence, should_exploit
+from exploits import get_exploit_adjustment
 from llm_engine import build_prompt, call_llm, check_reasoning_action_consistency
 from opponent_tracker import OpponentTracker
 from storage import GameStorage
@@ -87,17 +90,36 @@ def make_decision(
     pot_odds = calculate_pot_odds(to_call, pot)
     eq_cat = categorize_equity(eq)
 
-    # ── SPR + geometric sizing context ───────────────────────
+    # ── SPR + geometric sizing + board texture ────────────────
     spr = calculate_spr(stack, pot)
     streets_map = {"preflop": 3, "flop": 2, "turn": 1, "river": 0}
     streets_remaining = streets_map.get(street, 1)
     geo_size = geometric_bet_size(pot, stack, streets_remaining) if streets_remaining > 0 else 0
+    board_tex = classify_board(community_cards) if community_cards else "none"
+    tex_mult = texture_bet_multiplier(board_tex)
+
+    # ── Confidence + exploit check ───────────────────────────
+    # Get per-opponent stats for exploit logic
+    all_opp_stats = opponent_tracker.storage.get_all_opponent_stats()
+    # Use average opponent stats for exploit decisions
+    opp_stats_for_exploit = None
+    confidence_level = "none"
+    if all_opp_stats:
+        # Pick the opponent with most hands for exploit decisions
+        best_opp = max(all_opp_stats.values(), key=lambda s: s["hands_seen"])
+        opp_stats_for_exploit = best_opp
+        confidence_level = get_confidence(best_opp["hands_seen"])
+
+    exploit_action, exploit_name = get_exploit_adjustment(
+        opp_stats_for_exploit, eq, street, can_raise,
+    )
+    solver_rec = ""
 
     logger.info(
         "Strategy input — tier=%d adj_tier=%d equity=%.1f%% pot_odds=%.1f%% "
-        "to_call=%d can_check=%s street=%s spr=%.1f geo=%d",
+        "to_call=%d can_check=%s street=%s spr=%.1f geo=%d tex=%s conf=%s exploit=%s",
         hand_tier, adj_tier, eq * 100, pot_odds * 100, to_call, can_check, street,
-        spr, geo_size,
+        spr, geo_size, board_tex, confidence_level, exploit_name or "none",
     )
 
     # ── Layer 1: Preflop charts (instant) ──────────────────────
@@ -165,20 +187,21 @@ def make_decision(
         action = "fold"
         source = "equity"
 
-    # ── Layer 2b: Opponent-conditional adjustments ───────────
-    if action is None and checked_to_us and can_raise and min_raise:
-        avg_vpip = opponent_tracker.get_avg_vpip()
-        if avg_vpip is not None and avg_vpip > 0.40 and eq >= 0.45:
-            # Loose-passive opponents — value bet wider (council fix E)
-            raise_amt = min(int(pot * 0.6), stack)
-            raise_amt = max(raise_amt, min_raise)
+    # ── Layer 2b: Confidence-gated exploit adjustments ────────
+    if action is None and exploit_action and exploit_name and min_raise:
+        if exploit_action == "raise" and can_raise:
+            raise_amt = max(int(pot * tex_mult), min_raise)
+            raise_amt = min(raise_amt, stack)
             action = f"raise {raise_amt}"
-            source = "equity"
+            source = "exploit"
+            logger.info("Exploit triggered: %s → %s", exploit_name, action)
 
     # ── Layer 3: LLM for grey zone ───────────────────────────
     if action is None:
         source = "llm"
         opp_stats_summary = opponent_tracker.get_stats_summary()
+        from llm_engine import _get_solver_recommendation
+        solver_rec = _get_solver_recommendation(eq, pot_odds, to_call, can_check, can_raise)
         prompt = build_prompt(
             hole_cards=hole_cards,
             community_cards=community_cards,
@@ -192,6 +215,11 @@ def make_decision(
             position=position,
             opponent_stats=opp_stats_summary,
             valid_line=valid_line,
+            board_texture=board_tex,
+            spr=spr,
+            to_call=to_call,
+            can_check=can_check,
+            can_raise=can_raise,
         )
 
         action, reasoning, latency_ms, timed_out = call_llm(prompt)
@@ -252,6 +280,13 @@ def make_decision(
         decision=action,
         decision_source=source,
         response_time_ms=elapsed_ms,
+        board_texture=board_tex,
+        spr=spr,
+        geo_bet_size=geo_size,
+        confidence_level=confidence_level,
+        exploit_triggered=exploit_name,
+        solver_recommendation=solver_rec if source == "llm" else None,
+        llm_agreed_with_solver=None,  # TODO: parse from reasoning
     )
 
     return action

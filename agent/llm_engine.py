@@ -36,12 +36,18 @@ Analyze the situation and make ONE decision.
 <game_state>
 Your hole cards: {hole_cards} (Tier {hand_tier} — {tier_label})
 Community cards: {community}
+Board texture: {board_texture}
 Street: {street} | Pot: {pot} | Your stack: {stack}
+SPR (stack-to-pot): {spr:.1f} ({spr_category})
 Equity vs opponent range: {equity:.1%}
 Pot odds to call: {pot_odds:.1%}
 Equity category: {equity_category}
 Position: {position}
 </game_state>
+
+<solver_recommendation>
+{solver_recommendation}
+</solver_recommendation>
 
 <opponent_stats>
 {opponent_stats}
@@ -51,21 +57,79 @@ Position: {position}
 {valid_line}
 </valid_actions>
 
+<expert_examples>
+{few_shot_examples}
+</expert_examples>
+
 <instructions>
 Think step by step inside <think> tags, then give your final action inside <answer> tags.
 
 In your analysis, consider:
-1. Your hand strength (tier {hand_tier}) and how it connects with the board
+1. Your hand strength (tier {hand_tier}) and how it connects with the {board_texture} board
 2. Equity ({equity:.1%}) vs pot odds ({pot_odds:.1%}) — is calling profitable?
-3. Opponent tendencies — are they loose/tight, passive/aggressive?
-4. Position — do you act last (advantage) or first?
-5. Stack-to-pot ratio — how committed are you?
+3. The solver recommendation above — do you agree or see a reason to deviate?
+4. Opponent tendencies — are they loose/tight, passive/aggressive?
+5. SPR {spr:.1f} — at low SPR commit with decent hands, at high SPR be cautious
+6. Position — do you act last (advantage) or first?
 
 IMPORTANT: Inside <answer> tags, write ONLY the action. No explanation.
 Valid formats: fold | check | call | raise <amount>
 Example: <answer>raise 150</answer>
 </instructions>
 """
+
+# ── Few-shot expert examples by situation ────────────────────────────────────
+
+FEW_SHOT_EXAMPLES = {
+    "preflop_marginal": (
+        "Example: Hero has Js Th in CO, facing raise to 3BB. Equity 42%, pot odds 30%.\n"
+        "Expert decision: call. Suited broadway connector has good playability postflop."
+    ),
+    "postflop_value": (
+        "Example: Hero has Ah Kd on board Ac 7d 3s (flop). Equity 85%, checked to us.\n"
+        "Expert decision: raise 60% pot. Top pair top kicker — value bet, don't slow play."
+    ),
+    "postflop_draw": (
+        "Example: Hero has Jh Th on board 9h 5h Kc (flop). Equity 48%, facing bet.\n"
+        "Expert decision: call. Flush draw + gutshot = 12 outs, good implied odds."
+    ),
+    "river_bluff": (
+        "Example: Hero has 7h 6h on board 2h 5h Kc 3d 8s (river). Equity 7%, checked to us.\n"
+        "Expert decision: check. Missed draw, no fold equity vs calling station."
+    ),
+    "shallow_spr": (
+        "Example: Hero has As Qd, SPR 1.5, top pair on flop. Equity 60%.\n"
+        "Expert decision: raise all-in. At low SPR, commit with any top pair or better."
+    ),
+}
+
+
+def _get_few_shot(street: str, equity: float, spr: float, to_call: int) -> str:
+    examples = []
+    if street == "preflop" and 0.30 <= equity <= 0.55:
+        examples.append(FEW_SHOT_EXAMPLES["preflop_marginal"])
+    if street != "preflop" and equity >= 0.60 and to_call == 0:
+        examples.append(FEW_SHOT_EXAMPLES["postflop_value"])
+    if street != "preflop" and 0.35 <= equity <= 0.55:
+        examples.append(FEW_SHOT_EXAMPLES["postflop_draw"])
+    if street == "river" and equity < 0.20:
+        examples.append(FEW_SHOT_EXAMPLES["river_bluff"])
+    if spr <= 3.0 and equity >= 0.45:
+        examples.append(FEW_SHOT_EXAMPLES["shallow_spr"])
+    return "\n".join(examples) if examples else "(no similar examples)"
+
+
+def _get_solver_recommendation(equity: float, pot_odds: float, to_call: int,
+                                can_check: bool, can_raise: bool) -> str:
+    if to_call == 0 and can_check:
+        if equity >= 0.60 and can_raise:
+            return f"Math says: BET for value (equity {equity:.0%} is strong, checked to you)"
+        return f"Math says: CHECK is free (equity {equity:.0%})"
+    if equity > pot_odds + 0.10:
+        return f"Math says: CALL is +EV (equity {equity:.0%} > pot odds {pot_odds:.0%} + margin)"
+    if equity < pot_odds:
+        return f"Math says: FOLD is correct (equity {equity:.0%} < pot odds {pot_odds:.0%})"
+    return f"Math says: BORDERLINE (equity {equity:.0%} ≈ pot odds {pot_odds:.0%}, use judgment)"
 
 TIER_LABELS = {
     1: "premium",
@@ -89,20 +153,36 @@ def build_prompt(
     position: str,
     opponent_stats: str,
     valid_line: str,
+    board_texture: str = "none",
+    spr: float = 10.0,
+    to_call: int = 0,
+    can_check: bool = False,
+    can_raise: bool = False,
 ) -> str:
+    from bet_sizing import get_spr_category
+    spr_category = get_spr_category(spr)
+
+    solver_rec = _get_solver_recommendation(equity, pot_odds, to_call, can_check, can_raise)
+    few_shot = _get_few_shot(street, equity, spr, to_call)
+
     return PROMPT_TEMPLATE.format(
         hole_cards=" ".join(hole_cards) if hole_cards else "unknown",
         community=" ".join(community_cards) if community_cards else "none (preflop)",
+        board_texture=board_texture,
         street=street,
         pot=pot,
         stack=stack,
+        spr=spr,
+        spr_category=spr_category,
         equity=equity,
         pot_odds=pot_odds,
         equity_category=equity_category,
         hand_tier=hand_tier,
         tier_label=TIER_LABELS.get(hand_tier, "unknown"),
         position=position or "unknown",
+        solver_recommendation=solver_rec,
         opponent_stats=opponent_stats,
+        few_shot_examples=few_shot,
         valid_line=valid_line,
     )
 

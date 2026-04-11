@@ -43,7 +43,15 @@ def _create_tables(conn: sqlite3.Connection):
             llm_reasoning TEXT,
             decision TEXT,
             decision_source TEXT,
-            response_time_ms REAL
+            response_time_ms REAL,
+            -- v2: research improvements
+            board_texture TEXT,
+            spr REAL,
+            geo_bet_size INTEGER,
+            confidence_level TEXT,
+            exploit_triggered TEXT,
+            solver_recommendation TEXT,
+            llm_agreed_with_solver INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS opponent_stats (
@@ -53,6 +61,12 @@ def _create_tables(conn: sqlite3.Connection):
             pfr_count INTEGER DEFAULT 0,
             aggression_bets INTEGER DEFAULT 0,
             aggression_calls INTEGER DEFAULT 0,
+            fold_to_cbet_seen INTEGER DEFAULT 0,
+            fold_to_cbet_folded INTEGER DEFAULT 0,
+            three_bet_opportunities INTEGER DEFAULT 0,
+            three_bet_count INTEGER DEFAULT 0,
+            went_to_showdown INTEGER DEFAULT 0,
+            hands_reached_flop INTEGER DEFAULT 0,
             updated_at REAL
         );
 
@@ -93,6 +107,13 @@ class GameStorage:
         decision: str,
         decision_source: str,
         response_time_ms: float,
+        board_texture: str | None = None,
+        spr: float | None = None,
+        geo_bet_size: int | None = None,
+        confidence_level: str | None = None,
+        exploit_triggered: str | None = None,
+        solver_recommendation: str | None = None,
+        llm_agreed_with_solver: bool | None = None,
     ) -> int:
         ts = time.time()
         cursor = self.conn.execute(
@@ -100,14 +121,18 @@ class GameStorage:
                 round_num, timestamp, hole_cards, community_cards, street,
                 pot, stack, position, equity, pot_odds, hand_tier,
                 equity_category, llm_reasoning, decision, decision_source,
-                response_time_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                response_time_ms, board_texture, spr, geo_bet_size,
+                confidence_level, exploit_triggered, solver_recommendation,
+                llm_agreed_with_solver
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 round_num, ts,
                 " ".join(hole_cards), " ".join(community_cards), street,
                 pot, stack, position, equity, pot_odds, hand_tier,
                 equity_category, llm_reasoning, decision, decision_source,
-                response_time_ms,
+                response_time_ms, board_texture, spr, geo_bet_size,
+                confidence_level, exploit_triggered, solver_recommendation,
+                int(llm_agreed_with_solver) if llm_agreed_with_solver is not None else None,
             ),
         )
         self.conn.commit()
@@ -116,13 +141,18 @@ class GameStorage:
         self._save_hand_json(hand_id, round_num, ts, hole_cards, community_cards,
                              street, pot, stack, position, equity, pot_odds,
                              hand_tier, equity_category, llm_reasoning, decision,
-                             decision_source, response_time_ms)
+                             decision_source, response_time_ms, board_texture,
+                             spr, geo_bet_size, confidence_level, exploit_triggered,
+                             solver_recommendation, llm_agreed_with_solver)
         return hand_id
 
     def _save_hand_json(self, hand_id, round_num, ts, hole_cards, community_cards,
                         street, pot, stack, position, equity, pot_odds,
                         hand_tier, equity_category, llm_reasoning, decision,
-                        decision_source, response_time_ms):
+                        decision_source, response_time_ms, board_texture=None,
+                        spr=None, geo_bet_size=None, confidence_level=None,
+                        exploit_triggered=None, solver_recommendation=None,
+                        llm_agreed_with_solver=None):
         record = {
             "hand_id": hand_id,
             "round_num": round_num,
@@ -141,6 +171,13 @@ class GameStorage:
             "decision": decision,
             "decision_source": decision_source,
             "response_time_ms": round(response_time_ms, 1),
+            "board_texture": board_texture,
+            "spr": round(spr, 2) if spr is not None else None,
+            "geo_bet_size": geo_bet_size,
+            "confidence_level": confidence_level,
+            "exploit_triggered": exploit_triggered,
+            "solver_recommendation": solver_recommendation,
+            "llm_agreed_with_solver": llm_agreed_with_solver,
         }
         fname = f"round_{round_num or hand_id}.json"
         path = HANDS_DIR / fname
@@ -179,11 +216,16 @@ class GameStorage:
         return cursor.lastrowid
 
     def update_opponent(self, bot_username: str, vpip: bool, pfr: bool,
-                        is_bet_or_raise: bool):
+                        is_bet_or_raise: bool, folded_to_cbet: bool | None = None,
+                        is_three_bet: bool = False, three_bet_opportunity: bool = False,
+                        went_to_showdown: bool = False, reached_flop: bool = False):
         self.conn.execute(
             """INSERT INTO opponent_stats (bot_username, hands_seen, vpip_count,
-                pfr_count, aggression_bets, aggression_calls, updated_at)
-            VALUES (?, 1, ?, ?, ?, ?, ?)
+                pfr_count, aggression_bets, aggression_calls,
+                fold_to_cbet_seen, fold_to_cbet_folded,
+                three_bet_opportunities, three_bet_count,
+                went_to_showdown, hands_reached_flop, updated_at)
+            VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(bot_username) DO UPDATE SET
                 hands_seen = hands_seen + 1,
                 vpip_count = vpip_count + excluded.vpip_count,
@@ -191,10 +233,20 @@ class GameStorage:
                 aggression_bets = aggression_bets + excluded.aggression_bets,
                 aggression_calls = CASE WHEN excluded.aggression_calls > 0
                     THEN aggression_calls + 1 ELSE aggression_calls END,
+                fold_to_cbet_seen = fold_to_cbet_seen + excluded.fold_to_cbet_seen,
+                fold_to_cbet_folded = fold_to_cbet_folded + excluded.fold_to_cbet_folded,
+                three_bet_opportunities = three_bet_opportunities + excluded.three_bet_opportunities,
+                three_bet_count = three_bet_count + excluded.three_bet_count,
+                went_to_showdown = went_to_showdown + excluded.went_to_showdown,
+                hands_reached_flop = hands_reached_flop + excluded.hands_reached_flop,
                 updated_at = excluded.updated_at
             """,
             (bot_username, int(vpip), int(pfr), int(is_bet_or_raise),
-             int(not is_bet_or_raise and vpip), time.time()),
+             int(not is_bet_or_raise and vpip),
+             int(folded_to_cbet is not None), int(folded_to_cbet or False),
+             int(three_bet_opportunity), int(is_three_bet),
+             int(went_to_showdown), int(reached_flop),
+             time.time()),
         )
         self.conn.commit()
 
@@ -209,10 +261,21 @@ class GameStorage:
         h = d["hands_seen"] or 1
         d["vpip"] = d["vpip_count"] / h
         d["pfr"] = d["pfr_count"] / h
-        agg_total = d["aggression_bets"] + d["aggression_calls"]
         d["aggression_factor"] = (
             d["aggression_bets"] / d["aggression_calls"]
             if d["aggression_calls"] > 0 else d["aggression_bets"]
+        )
+        d["fold_to_cbet"] = (
+            d["fold_to_cbet_folded"] / d["fold_to_cbet_seen"]
+            if d["fold_to_cbet_seen"] > 0 else None
+        )
+        d["three_bet_freq"] = (
+            d["three_bet_count"] / d["three_bet_opportunities"]
+            if d["three_bet_opportunities"] > 0 else None
+        )
+        d["wtsd"] = (
+            d["went_to_showdown"] / d["hands_reached_flop"]
+            if d["hands_reached_flop"] > 0 else None
         )
         return d
 
@@ -227,6 +290,18 @@ class GameStorage:
             d["aggression_factor"] = (
                 d["aggression_bets"] / d["aggression_calls"]
                 if d["aggression_calls"] > 0 else d["aggression_bets"]
+            )
+            d["fold_to_cbet"] = (
+                d["fold_to_cbet_folded"] / d["fold_to_cbet_seen"]
+                if d.get("fold_to_cbet_seen", 0) > 0 else None
+            )
+            d["three_bet_freq"] = (
+                d["three_bet_count"] / d["three_bet_opportunities"]
+                if d.get("three_bet_opportunities", 0) > 0 else None
+            )
+            d["wtsd"] = (
+                d["went_to_showdown"] / d["hands_reached_flop"]
+                if d.get("hands_reached_flop", 0) > 0 else None
             )
             result[d["bot_username"]] = d
         return result
