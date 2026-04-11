@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -20,65 +21,17 @@ from telegram.ext import (
 from opponent_tracker import OpponentTracker
 from storage import GameStorage
 from strategy import make_decision
+from strategy_profiles import get_profile
 
-load_dotenv()
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
-AGENT_BOT_TOKEN = os.environ["AGENT_BOT_TOKEN"]
-AGENT_USERNAME = os.environ["AGENT_USERNAME"]
-MAIN_GROUP_ID = int(os.environ["MAIN_GROUP_ID"])
-PRIVATE_GROUP_ID = int(os.environ["PRIVATE_GROUP_ID"])
-DEALER_USERNAME = os.getenv("DEALER_USERNAME", "aicollective_poker_dealer_bot")
-AI_CLI_PATH = os.getenv("CODEX_PATH", "codex")
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
-logger = logging.getLogger("agent")
-logger.setLevel(logging.DEBUG)
-
-_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-_fh = RotatingFileHandler(LOG_DIR / f"{AGENT_USERNAME}.log", maxBytes=5_000_000, backupCount=3)
-_fh.setLevel(logging.DEBUG)
-_fh.setFormatter(_fmt)
-logger.addHandler(_fh)
-
-_ch = logging.StreamHandler()
-_ch.setLevel(logging.INFO)
-_ch.setFormatter(_fmt)
-logger.addHandler(_ch)
-
-# ── Game State ────────────────────────────────────────────────────────────────
-
-hole_cards: list[str] = []
-community_cards: list[str] = []
-pot: int = 0
-stack: int = 0
-street: str = "preflop"
-position: str = ""
-round_num: str = ""
-opponent_actions: deque[str] = deque(maxlen=10)
-
-# ── Services ──────────────────────────────────────────────────────────────────
-
-storage = GameStorage()
-tracker = OpponentTracker(storage, AGENT_USERNAME)
-
-# ── Parsing ───────────────────────────────────────────────────────────────────
+# ── Parsing regexes (shared) ─────────────────────────────────────────────────
 
 CARD_RE = re.compile(r"[2-9TJQKA][hdcs]")
-
 RE_STREET = re.compile(r"Street:\s*(\w+)", re.IGNORECASE)
 RE_POT = re.compile(r"Pot:\s*(\d+)", re.IGNORECASE)
 RE_STACK = re.compile(r"Stack:\s*(\d+)", re.IGNORECASE)
 RE_COMMUNITY = re.compile(r"Community:\s*([^\n]+)", re.IGNORECASE)
 RE_POSITION = re.compile(r"Position:\s*(\w+)", re.IGNORECASE)
 RE_ROUND_NUM = re.compile(r"Round\s*#(\d+)", re.IGNORECASE)
-
 RE_HOLE_ROUND = re.compile(r"Round\s*#\d+:\s*([2-9TJQKA][hdcs])\s+([2-9TJQKA][hdcs])")
 RE_HOLE_BARE = re.compile(r"[`*]?\s*([2-9TJQKA][hdcs])\s+([2-9TJQKA][hdcs])\s*[`*]?")
 
@@ -113,137 +66,186 @@ def parse_hole_cards(text: str) -> list[str] | None:
         return [m.group(1), m.group(2)]
     return None
 
-# ── Telegram Handlers ─────────────────────────────────────────────────────────
 
-async def handle_turn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global pot, stack, street, community_cards, position
+# ── Bot Instance ──────────────────────────────────────────────────────────────
 
-    msg = update.effective_message
-    if not msg or not msg.text:
-        return
+class PokerBot:
+    """A single poker bot instance with its own config, storage, and state."""
 
-    chat_id = msg.chat_id
-    logger.info("/turn received [msg=%s chat=%s]: %.120s", msg.message_id, chat_id, msg.text)
+    def __init__(self, env_file: str | None = None):
+        if env_file:
+            load_dotenv(env_file, override=True)
+        else:
+            load_dotenv()
 
-    text = msg.text
-    lines = text.splitlines()
-    body = "\n".join(lines[1:]) if len(lines) > 1 else text
+        self.token = os.environ["AGENT_BOT_TOKEN"]
+        self.username = os.environ["AGENT_USERNAME"]
+        self.main_group_id = int(os.environ["MAIN_GROUP_ID"])
+        self.private_group_id = int(os.environ["PRIVATE_GROUP_ID"])
+        self.dealer_username = os.getenv("DEALER_USERNAME", "aicollective_poker_dealer_bot")
+        self.ai_cli_path = os.getenv("CODEX_PATH", "claude")
+        self.profile = get_profile(os.getenv("STRATEGY_PROFILE", "gto"))
 
-    state = parse_turn_message(body)
-    street = state.get("street", street)
-    pot = state.get("pot", pot)
-    stack = state.get("stack", stack)
-    if "community" in state:
-        community_cards = state["community"]
-    # Update position from /turn if available (fallback to existing or "MP")
-    if "position" in state:
-        position = state["position"]
-    elif not position:
-        position = "MP"
-    valid_line = state.get("valid_line", "Valid: /fold /call")
+        # Game state
+        self.hole_cards: list[str] = []
+        self.community_cards: list[str] = []
+        self.pot: int = 0
+        self.stack: int = 0
+        self.street: str = "preflop"
+        self.position: str = ""
+        self.round_num: str = ""
+        self.opponent_actions: deque[str] = deque(maxlen=10)
 
-    tracker.set_street(street)
+        # Services
+        self.storage = GameStorage(bot_name=self.username)
+        self.tracker = OpponentTracker(self.storage, self.username)
 
-    logger.info("Parsed state — street=%s pot=%d stack=%d community=%s hole=%s pos=%s",
-                street, pot, stack, community_cards, hole_cards, position)
+        # Logging
+        self.logger = self._setup_logging()
+        self.logger.info("Bot initialized: @%s (profile=%s, cli=%s)",
+                         self.username, self.profile.name, self.ai_cli_path)
 
-    loop = asyncio.get_event_loop()
-    action = await loop.run_in_executor(
-        None,
-        make_decision,
-        hole_cards, community_cards, street, pot, stack,
-        position, valid_line, tracker, storage, round_num,
-    )
+    def _setup_logging(self) -> logging.Logger:
+        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
 
-    logger.info("Decision: %s", action)
+        bot_logger = logging.getLogger(f"agent.{self.username}")
+        bot_logger.setLevel(logging.DEBUG)
 
-    parts = action.split()
-    if parts[0] == "raise" and len(parts) == 2:
-        command = f"/raise {parts[1]}"
-    else:
-        command = f"/{parts[0]}"
+        if not bot_logger.handlers:
+            fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    await context.bot.send_message(MAIN_GROUP_ID, command)
-    logger.info("Sent to main group: %s", command)
+            fh = RotatingFileHandler(
+                log_dir / f"{self.username}.log", maxBytes=5_000_000, backupCount=3
+            )
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt)
+            bot_logger.addHandler(fh)
+
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
+            ch.setFormatter(fmt)
+            bot_logger.addHandler(ch)
+
+        return bot_logger
+
+    # ── Handlers ──────────────────────────────────────────────
+
+    async def handle_turn(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return
+
+        self.logger.info("/turn received [msg=%s]: %.120s", msg.message_id, msg.text)
+
+        lines = msg.text.splitlines()
+        body = "\n".join(lines[1:]) if len(lines) > 1 else msg.text
+
+        state = parse_turn_message(body)
+        self.street = state.get("street", self.street)
+        self.pot = state.get("pot", self.pot)
+        self.stack = state.get("stack", self.stack)
+        if "community" in state:
+            self.community_cards = state["community"]
+        if "position" in state:
+            self.position = state["position"]
+        elif not self.position:
+            self.position = "MP"
+        valid_line = state.get("valid_line", "Valid: /fold /call")
+
+        self.tracker.set_street(self.street)
+
+        self.logger.info("State — street=%s pot=%d stack=%d community=%s hole=%s pos=%s",
+                         self.street, self.pot, self.stack, self.community_cards,
+                         self.hole_cards, self.position)
+
+        loop = asyncio.get_event_loop()
+        action = await loop.run_in_executor(
+            None, make_decision,
+            self.hole_cards, self.community_cards, self.street, self.pot,
+            self.stack, self.position, valid_line, self.tracker, self.storage,
+            self.round_num,
+        )
+
+        self.logger.info("Decision: %s", action)
+
+        parts = action.split()
+        if parts[0] == "raise" and len(parts) == 2:
+            command = f"/raise {parts[1]}"
+        else:
+            command = f"/{parts[0]}"
+
+        await context.bot.send_message(self.main_group_id, command)
+        self.logger.info("Sent: %s", command)
+
+    async def handle_private_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return
+
+        cards = parse_hole_cards(msg.text)
+        if cards:
+            self.hole_cards = cards
+            self.community_cards = []
+            self.opponent_actions.clear()
+            self.tracker.reset_round()
+
+            if m := RE_POSITION.search(msg.text):
+                self.position = m.group(1).upper()
+            if m := RE_ROUND_NUM.search(msg.text):
+                self.round_num = m.group(1)
+
+            self.logger.info("Round #%s — hole: %s, pos: %s",
+                             self.round_num, self.hole_cards, self.position)
+
+    async def handle_main_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return
+
+        text = msg.text
+        if text.startswith("[DEALER]"):
+            self.opponent_actions.append(text)
+            new_community = self.tracker.parse_dealer_message(text)
+            if new_community:
+                self.community_cards = new_community
+                self.logger.debug("Community updated: %s", self.community_cards)
+
+    # ── Run ───────────────────────────────────────────────────
+
+    def run(self):
+        try:
+            subprocess.run([self.ai_cli_path, "--version"], timeout=5, capture_output=True)
+            self.logger.info("AI CLI verified: %s", self.ai_cli_path)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            self.logger.warning("AI CLI check failed (%s)", e)
+
+        app = Application.builder().token(self.token).build()
+
+        app.add_handler(CommandHandler("turn", self.handle_turn))
+        app.add_handler(MessageHandler(
+            filters.Chat(self.private_group_id) & filters.TEXT & ~filters.COMMAND,
+            self.handle_private_message,
+        ))
+        app.add_handler(MessageHandler(
+            filters.Chat(self.main_group_id) & filters.TEXT & ~filters.COMMAND,
+            self.handle_main_message,
+        ))
+
+        async def post_ready(application):
+            await application.bot.send_message(self.private_group_id, "/ready")
+            self.logger.info("Sent /ready to private group")
+
+        app.post_init = post_ready
+
+        self.logger.info("Starting @%s (profile=%s) — polling...", self.username, self.profile.name)
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global hole_cards, community_cards, position, round_num
-
-    msg = update.effective_message
-    if not msg or not msg.text:
-        return
-
-    text = msg.text
-
-    cards = parse_hole_cards(text)
-    if cards:
-        hole_cards = cards
-        community_cards = []
-        opponent_actions.clear()
-        tracker.reset_round()
-
-        if m := RE_POSITION.search(text):
-            position = m.group(1).upper()
-        if m := RE_ROUND_NUM.search(text):
-            round_num = m.group(1)
-
-        logger.info("Round #%s — hole cards: %s, position: %s", round_num, hole_cards, position)
-
-
-async def handle_main_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global community_cards
-
-    msg = update.effective_message
-    if not msg or not msg.text:
-        return
-
-    text = msg.text
-    if text.startswith("[DEALER]"):
-        opponent_actions.append(text)
-
-        # Update opponent stats + community cards
-        new_community = tracker.parse_dealer_message(text)
-        if new_community:
-            community_cards = new_community
-            logger.debug("Community updated from dealer: %s", community_cards)
-
-# ── Startup ───────────────────────────────────────────────────────────────────
-
-async def post_ready(application: Application) -> None:
-    await application.bot.send_message(PRIVATE_GROUP_ID, "/ready")
-    logger.info("Sent /ready to private group %s", PRIVATE_GROUP_ID)
-
-
-def main() -> None:
-    # Verify AI CLI is reachable
-    try:
-        subprocess.run([AI_CLI_PATH, "--version"], timeout=5, capture_output=True)
-        logger.info("AI CLI verified: %s", AI_CLI_PATH)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning("AI CLI check failed (%s) — bot will use rule/equity layers only", e)
-
-    app = Application.builder().token(AGENT_BOT_TOKEN).build()
-
-    # Handler 1: /turn command (any chat)
-    app.add_handler(CommandHandler("turn", handle_turn))
-
-    # Handler 2: private group messages (hole cards)
-    app.add_handler(MessageHandler(
-        filters.Chat(PRIVATE_GROUP_ID) & filters.TEXT & ~filters.COMMAND,
-        handle_private_message,
-    ))
-
-    # Handler 3: main group messages (passive observation)
-    app.add_handler(MessageHandler(
-        filters.Chat(MAIN_GROUP_ID) & filters.TEXT & ~filters.COMMAND,
-        handle_main_message,
-    ))
-
-    app.post_init = post_ready
-
-    logger.info("Starting %s — polling...", AGENT_USERNAME)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+def main():
+    env_file = sys.argv[1] if len(sys.argv) > 1 else None
+    bot = PokerBot(env_file=env_file)
+    bot.run()
 
 
 if __name__ == "__main__":

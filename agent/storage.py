@@ -5,23 +5,29 @@ import sqlite3
 import time
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-HANDS_DIR = DATA_DIR / "hands"
-DB_PATH = DATA_DIR / "game.db"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 
 
-def _ensure_dirs():
-    DATA_DIR.mkdir(exist_ok=True)
-    HANDS_DIR.mkdir(exist_ok=True)
+def _get_dirs(bot_name: str | None = None):
+    if bot_name:
+        data_dir = PROJECT_ROOT / "data" / bot_name
+    else:
+        data_dir = DEFAULT_DATA_DIR
+    hands_dir = data_dir / "hands"
+    db_path = data_dir / "game.db"
+    return data_dir, hands_dir, db_path
 
 
-def get_db() -> sqlite3.Connection:
-    _ensure_dirs()
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+def get_db(bot_name: str | None = None) -> tuple[sqlite3.Connection, Path, Path]:
+    data_dir, hands_dir, db_path = _get_dirs(bot_name)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    hands_dir.mkdir(exist_ok=True)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     _create_tables(conn)
-    return conn
+    return conn, hands_dir, db_path
 
 
 def _create_tables(conn: sqlite3.Connection):
@@ -87,8 +93,9 @@ def _create_tables(conn: sqlite3.Connection):
 
 
 class GameStorage:
-    def __init__(self):
-        self.conn = get_db()
+    def __init__(self, bot_name: str | None = None):
+        self.bot_name = bot_name
+        self.conn, self.hands_dir, self.db_path = get_db(bot_name)
 
     def save_hand(
         self,
@@ -180,7 +187,7 @@ class GameStorage:
             "llm_agreed_with_solver": llm_agreed_with_solver,
         }
         fname = f"round_{round_num or hand_id}.json"
-        path = HANDS_DIR / fname
+        path = self.hands_dir / fname
         # Append to existing round file if it exists
         if path.exists():
             with open(path) as f:
