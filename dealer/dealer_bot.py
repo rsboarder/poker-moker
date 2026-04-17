@@ -579,7 +579,12 @@ class TableSession:
                 await self._send_showdown(ev)  # sets rich showdown_result for spectator overlay
                 self._update_spectator()
 
-            await asyncio.sleep(0.3)
+            # Event-dispatch pacing: only slow down in spectator mode.
+            # Without this guard, 30 bots × many events per hand = 40-minute turniament.
+            with _spectator_lock:
+                in_spec_mode = _spectator_state.get("spectator_mode", False)
+            if in_spec_mode:
+                await asyncio.sleep(0.3)
 
     def _parse_dealer_text_to_event(self, text: str) -> dict:
         """Convert [DEALER] text to structured WS event."""
@@ -1876,11 +1881,21 @@ class DealerBot:
                     "players_left": len(all_alive),
                 })
 
+        # ── Decide the consolidation plan UP-FRONT, before any mutation ────────
+        # Computing `already_single` AFTER popping broken tables was a bug: when
+        # the penultimate table breaks, len(self.tables) drops to 1 and code
+        # thinks "already consolidated" when in fact the survivor still needs
+        # to be moved to the final table. Snapshot now.
+        forming_final_table = (
+            len(all_alive) >= 2
+            and len(all_alive) <= self._table_size
+            and len(self.tables) > 1
+        )
+
         # Find tables that are done (≤1 active player) — their survivors need relocating
         to_break: list[int] = []
         for tid, table in list(self.tables.items()):
             alive = [a for a in table.agents if a.stack > 0]
-            # Break table if it has <=1 survivor AND is not running
             if tid not in self._table_tasks and len(alive) <= 1:
                 to_break.append(tid)
 
@@ -1888,9 +1903,9 @@ class DealerBot:
             table = self.tables[tid]
             survivors = [a for a in table.agents if a.stack > 0]
 
-            # If final table is needed (total alive ≤ table_size), consolidate later
-            if len(all_alive) <= self._table_size and len(self.tables) > 1:
-                # Hold survivors; final table will be created below
+            if forming_final_table:
+                # Hold survivors — the final-table block below will seat them.
+                # Don't relocate to a doomed table whose task is about to be shut down.
                 pass
             elif survivors:
                 # Move each survivor to the smallest OTHER active table
@@ -1925,24 +1940,23 @@ class DealerBot:
                     tables_state.pop(str(tid), None)
             log.info("[T%d] table broken", tid)
 
-        # Form final table when remaining players can all fit at one table AND
-        # we don't already have a single table (regardless of dead-seat bookkeeping
-        # inside that table's .agents list, which retains eliminated players).
-        fits_one_table = len(all_alive) <= self._table_size
-        already_single = len(self.tables) == 1
-        if len(all_alive) >= 2 and fits_one_table and not already_single:
+        # Form final table when the pre-snapshot said we should.
+        if forming_final_table:
             # Graceful shutdown: flag tables to exit AFTER their current round
             # completes, not mid-hand (avoids losing all-in pots).
             for tid, t in self.tables.items():
                 t._stop_after_round = True
             # Wait for tasks to finish naturally (they'll see the flag at top of
-            # next iteration). return_exceptions so a failing task doesn't block us.
+            # next iteration). Gather with return_exceptions so a crash doesn't
+            # skip other tasks — but re-raise afterwards so the coordinator
+            # aborts instead of silently crowning someone. Integrity > continuity.
             pending = [task for task in self._table_tasks.values() if not task.done()]
             if pending:
-                try:
-                    await asyncio.gather(*pending, return_exceptions=True)
-                except Exception:
-                    pass
+                results = await asyncio.gather(*pending, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                        log.error("Table task crashed during consolidation: %r — aborting", r)
+                        raise r
             self._table_tasks.clear()
             # Re-sync stacks after last hand played to capture final results
             for t in self.tables.values():
