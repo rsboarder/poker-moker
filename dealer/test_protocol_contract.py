@@ -60,7 +60,7 @@ CONTRACT: dict[str, dict] = {
         "optional": {"token", "reconnected"},
     },
     "cards": {
-        "required": {"type", "round", "hole_cards"},
+        "required": {"type", "table_id", "round", "hole_cards"},
         "optional": set(),
     },
     "turn": {
@@ -72,16 +72,16 @@ CONTRACT: dict[str, dict] = {
         "optional": set(),
     },
     "event": {
-        "required": {"type", "text"},
+        "required": {"type", "table_id", "text"},
         # Structured event fields only appear when parseable from the dealer text
         "optional": {"player", "action", "amount", "pot", "street", "community"},
     },
     "showdown": {
-        "required": {"type", "winner", "winner_id", "pot", "hands", "reason"},
+        "required": {"type", "table_id", "winner", "winner_id", "pot", "hands", "reason"},
         "optional": set(),
     },
     "round_end": {
-        "required": {"type", "round", "players"},
+        "required": {"type", "table_id", "round", "players"},
         "optional": set(),
     },
     "eliminated": {

@@ -392,6 +392,10 @@ class TableSession:
         self.bb_player_id: int | None = None
         self.btn_player_id: int | None = None
 
+        # Set when coordinator wants this table to exit after the current round completes
+        # (used for graceful final-table formation instead of hard-cancelling mid-hand).
+        self._stop_after_round: bool = False
+
     def _tg_prefix(self) -> str:
         """Return '[Tn] ' prefix when multi-table, empty otherwise. Decided from spectator state."""
         with _spectator_lock:
@@ -402,12 +406,18 @@ class TableSession:
         """Send to TG with table prefix when multi-table."""
         await _send(self.bot, MAIN_GROUP_ID, self._tg_prefix() + text)
 
-    def accept_action(self, sender_username: str, action: str, amount: int) -> bool:
-        """Try to accept an action from a Telegram message. Returns True if accepted."""
+    def accept_action(self, sender_username: str, action: str, amount: int,
+                      turn_id: int | None = None) -> bool:
+        """Try to accept an action. Returns True if accepted.
+        If turn_id is provided, it MUST match self._turn_id (reject stale replies)."""
         if not self._pending_player_id:
             return False
         expected = self._by_player_id.get(self._pending_player_id)
         if expected is None or sender_username != expected.username.lower():
+            return False
+        if turn_id is not None and turn_id != self._turn_id:
+            log.warning("[T%d] stale turn_id from @%s: got %s expected %s",
+                        self.table_id, sender_username, turn_id, self._turn_id)
             return False
         self._received_action = (action, amount)
         self._action_event.set()
@@ -524,6 +534,7 @@ class TableSession:
             })
         await self._ws_broadcast({
             "type": "round_end",
+            "table_id": self.table_id,
             "round": self.engine.round_number,
             "players": players_final,
         })
@@ -558,6 +569,7 @@ class TableSession:
                 winner_agent = self._by_player_id.get(winner_id)
                 await self._ws_broadcast({
                     "type": "showdown",
+                    "table_id": self.table_id,
                     "winner": winner_agent.username if winner_agent else f"player_{winner_id}",
                     "winner_id": winner_id,
                     "pot": ev.data.get("pot"),
@@ -572,7 +584,7 @@ class TableSession:
     def _parse_dealer_text_to_event(self, text: str) -> dict:
         """Convert [DEALER] text to structured WS event."""
         import re
-        event = {"type": "event", "text": text}
+        event = {"type": "event", "table_id": self.table_id, "text": text}
 
         # "[DEALER] aggressor folds."
         m = re.match(r'\[DEALER\]\s+(\S+)\s+(folds|checks|calls\s+\d+|raises to\s+\d+)', text)
@@ -636,6 +648,7 @@ class TableSession:
             try:
                 await ws.send(json.dumps({
                     "type": "cards",
+                    "table_id": self.table_id,
                     "round": round_num,
                     "hole_cards": cards,
                 }))
@@ -672,12 +685,21 @@ class TableSession:
             to_call = self.engine._to_call(player) if player else 0
             max_bet = max(p.street_bet for p in self.engine.players)
             min_raise = max_bet + self.engine.big_blind
+            player_total = (player.stack + player.street_bet) if player else 0
 
-            valid_actions = []
+            # Short-stack guard: if player can't afford a legal min_raise, drop
+            # the 'raise' option entirely (prevents bots from sending invalid
+            # raises based on advertised-but-impossible range like "raise 240-170").
+            can_raise = player_total >= min_raise
+
+            valid_actions: list[str] = []
             if to_call > 0:
-                valid_actions = [f"fold", f"call {to_call}", f"raise {min_raise}-{player.stack + player.street_bet}"]
+                valid_actions.append("fold")
+                valid_actions.append(f"call {to_call}")
             else:
-                valid_actions = [f"check", f"raise {min_raise}-{player.stack + player.street_bet}"]
+                valid_actions.append("check")
+            if can_raise:
+                valid_actions.append(f"raise {min_raise}-{player_total}")
 
             # Build players list with stacks and status
             players_info = []
@@ -1045,7 +1067,11 @@ class DealerBot:
         except websockets.ConnectionClosed:
             pass
         finally:
-            if username and username in self.ws_connections:
+            # Only drop the mapping if it still points at OUR socket.
+            # On reconnect, the new handler has already overwritten
+            # ws_connections[username] with a fresh ws — we must not delete
+            # the new one when our old socket closes.
+            if username and self.ws_connections.get(username) is ws:
                 del self.ws_connections[username]
                 log.info("WS disconnected: %s (%d online)", username, len(self.ws_connections))
                 with _spectator_lock:
@@ -1123,7 +1149,16 @@ class DealerBot:
             return
 
         action = (msg.get("action") or "").lower().strip()
-        amount = int(msg.get("amount", 0))
+        # Guard int() against non-numeric payloads (string, float, null, etc.)
+        raw_amount = msg.get("amount", 0)
+        try:
+            amount = int(raw_amount) if raw_amount is not None else 0
+        except (ValueError, TypeError):
+            await ws.send(json.dumps({
+                "type": "error",
+                "text": f"invalid amount: {raw_amount!r} (must be integer)",
+            }))
+            return
         if action not in ("fold", "check", "call", "raise"):
             await ws.send(json.dumps({"type": "error", "text": f"invalid action: {action}"}))
             return
@@ -1134,9 +1169,23 @@ class DealerBot:
             await ws.send(json.dumps({"type": "error", "text": "you are not seated at any table"}))
             return
 
-        accepted = target_table.accept_action(username, action, amount)
+        # Enforce turn_id (stale replies rejected). None means legacy client without turn_id.
+        msg_turn_id = msg.get("turn_id")
+        try:
+            msg_turn_id = int(msg_turn_id) if msg_turn_id is not None else None
+        except (ValueError, TypeError):
+            msg_turn_id = None
+
+        accepted = target_table.accept_action(username, action, amount, turn_id=msg_turn_id)
         if not accepted:
-            await ws.send(json.dumps({"type": "error", "text": "not your turn"}))
+            # Distinguish stale turn from wrong-player
+            if (msg_turn_id is not None
+                    and target_table._pending_player_id is not None
+                    and msg_turn_id != target_table._turn_id):
+                text = f"stale turn_id {msg_turn_id} (current: {target_table._turn_id})"
+            else:
+                text = "not your turn"
+            await ws.send(json.dumps({"type": "error", "text": text}))
 
     # ------------------------------------------------------------------
     # Public command handlers
@@ -1204,24 +1253,40 @@ class DealerBot:
 
     async def _stop_all_tables(self):
         """Cancel all table tasks and tournament coordinator, stop all TableSessions.
+        Awaits cancellations to ensure old tasks cannot emit into a new tournament.
         Self-aware: if called from within the coordinator task itself, does NOT
         cancel that task (would deadlock)."""
         try:
             current = asyncio.current_task()
         except RuntimeError:
             current = None
+
+        # Collect tasks to await (only those we actually cancel)
+        to_await: list[asyncio.Task] = []
         if (
             self._tournament_task
             and not self._tournament_task.done()
             and self._tournament_task is not current
         ):
             self._tournament_task.cancel()
+            to_await.append(self._tournament_task)
         for task in self._table_tasks.values():
             if not task.done() and task is not current:
                 task.cancel()
+                to_await.append(task)
+
+        # Unblock any in-flight _wait_for_action so cancellation can propagate cleanly
         for t in self.tables.values():
             t.stop()
             t.engine.state = GameState.WAITING
+
+        # Await cancellations so old tasks fully unwind before we clear state
+        if to_await:
+            try:
+                await asyncio.gather(*to_await, return_exceptions=True)
+            except Exception:
+                pass
+
         self._table_tasks.clear()
         if self._tournament_task is not current:
             self._tournament_task = None
@@ -1650,10 +1715,19 @@ class DealerBot:
             except Exception:
                 pass
         finally:
-            # COMPLETE → IDLE after a brief settle so HTTP /state callers can still
-            # see "tournament_over" display string; next /startgame can proceed.
-            if self._tournament_state == TournamentState.COMPLETE:
-                self._tournament_state = TournamentState.IDLE
+            # ALWAYS drop to IDLE regardless of prior state — otherwise a coordinator
+            # exception leaves us stuck in RUNNING and /startgame is permanently locked.
+            # Cancel any still-running table tasks so they don't emit stray events.
+            for task in list(self._table_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            if self._table_tasks:
+                try:
+                    await asyncio.gather(*self._table_tasks.values(), return_exceptions=True)
+                except Exception:
+                    pass
+                self._table_tasks.clear()
+            self._tournament_state = TournamentState.IDLE
 
     async def _run_table_loop(self, table_id: int):
         """Run rounds at one table until ≤1 player remains at that table OR
@@ -1667,15 +1741,25 @@ class DealerBot:
 
         try:
             while True:
+                # Graceful exit: coordinator set the flag AND we just finished a round —
+                # stop cleanly without cancelling mid-hand.
+                if table._stop_after_round:
+                    log.info("[T%d] table exiting gracefully (stop_after_round)", table_id)
+                    break
                 # Re-read agents each iteration — may have been mutated by breaking logic
                 active = [a for a in table.agents if a.stack > 0]
                 if len(active) < 2:
                     log.info("[T%d] table exiting — %d active player(s)", table_id, len(active))
                     break
 
-                # Update blinds for this round from the global clock
-                self._global_round_count += 1
-                new_sb, new_bb = get_blinds(self._global_round_count)
+                # Blind level = max round played across ALL active tables (shared clock).
+                # Per-table increment was causing N× faster escalation with N parallel tables.
+                table_round = table.engine.round_number + 1  # about to play this round
+                max_round = max(
+                    [t.engine.round_number for t in self.tables.values()] + [table_round]
+                )
+                self._global_round_count = max_round
+                new_sb, new_bb = get_blinds(max_round)
                 if (new_sb, new_bb) != (table.engine.small_blind, table.engine.big_blind):
                     table.engine.set_blinds(new_sb, new_bb)
 
@@ -1761,8 +1845,13 @@ class DealerBot:
                         "new_table": target_tid,
                     })
 
-            # Remove the broken table
+            # Remove the broken table — from both self.tables AND spectator state
             self.tables.pop(tid, None)
+            with _spectator_lock:
+                _spectator_state["table_count"] = len(self.tables)
+                tables_state = _spectator_state.get("tables", {})
+                if isinstance(tables_state, dict):
+                    tables_state.pop(str(tid), None)
             log.info("[T%d] table broken", tid)
 
         # Form final table when remaining players can all fit at one table AND
@@ -1773,15 +1862,33 @@ class DealerBot:
             all(len(t.agents) == len(all_alive) for t in self.tables.values())
         )
         if len(all_alive) >= 2 and fits_one_table and not single_running:
-            # Cancel all running tables
-            for task in self._table_tasks.values():
-                if not task.done():
-                    task.cancel()
-            try:
-                await asyncio.gather(*self._table_tasks.values(), return_exceptions=True)
-            except Exception:
-                pass
+            # Graceful shutdown: flag tables to exit AFTER their current round
+            # completes, not mid-hand (avoids losing all-in pots).
+            for tid, t in self.tables.items():
+                t._stop_after_round = True
+            # Wait for tasks to finish naturally (they'll see the flag at top of
+            # next iteration). return_exceptions so a failing task doesn't block us.
+            pending = [task for task in self._table_tasks.values() if not task.done()]
+            if pending:
+                try:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                except Exception:
+                    pass
             self._table_tasks.clear()
+            # Re-sync stacks after last hand played to capture final results
+            for t in self.tables.values():
+                for p in t.engine.players:
+                    agent = t._by_player_id.get(p.id)
+                    if agent:
+                        agent.stack = p.stack
+            # Recompute alive list — survivors may have changed during the last hand
+            all_alive = [a for a in agents if a.stack > 0]
+            if len(all_alive) < 2:
+                # Tournament actually finished during final round — skip final table
+                log.info("Tournament finished before final table formation: %d alive",
+                         len(all_alive))
+                self.tables.clear()
+                return
 
             # Clear old tables, create single final table
             self.tables.clear()

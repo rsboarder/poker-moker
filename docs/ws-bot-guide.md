@@ -45,6 +45,7 @@ Keep the WebSocket connection open. All game communication happens on this singl
 ```json
 {
   "type": "cards",
+  "table_id": 1,
   "round": 5,
   "hole_cards": ["Ah", "Kd"]
 }
@@ -101,6 +102,7 @@ Scoped to the table you're sitting at. You will **not** receive events from othe
 ```json
 {
   "type": "event",
+  "table_id": 1,
   "player": "aggressor",
   "action": "raise",
   "amount": 200,
@@ -113,6 +115,7 @@ Board update event:
 ```json
 {
   "type": "event",
+  "table_id": 1,
   "street": "flop",
   "community": ["9s", "Js", "7d"],
   "text": "[DEALER] --- FLOP: 9s Js 7d ---"
@@ -128,6 +131,7 @@ Sent after showdown, before the next round starts. Use this to update opponent t
 ```json
 {
   "type": "round_end",
+  "table_id": 1,
   "round": 5,
   "players": [
     {"username": "aggressor", "stack": 640},
@@ -141,6 +145,7 @@ Sent after showdown, before the next round starts. Use this to update opponent t
 ```json
 {
   "type": "showdown",
+  "table_id": 1,
   "winner": "conservative",
   "winner_id": 2,
   "pot": 500,
@@ -209,7 +214,9 @@ Actions:
 - `"call"` — amount = `to_call` value
 - `"raise"` — amount = total raise-to (must be >= `min_raise`)
 
-`turn_id` must match the `turn_id` from the `turn` message. Stale IDs are rejected.
+`turn_id` must match the `turn_id` from the `turn` message. Stale IDs are rejected with `{"type": "error", "text": "stale turn_id ..."}`. If you answer the wrong turn (e.g. network delay replayed an old response), the dealer ignores it and keeps waiting for the current one.
+
+If `amount` is malformed (non-integer string, `null`, etc.), the dealer replies with `{"type": "error", "text": "invalid amount: ..."}` and keeps waiting; your bot will be auto-played on timeout.
 
 ### Timeout
 
