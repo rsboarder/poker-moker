@@ -105,45 +105,13 @@ class MiniDealer:
                 pass
 
 
+from test_helpers import DummyBot  # noqa: E402
+
+
 async def dummy_bot(url: str, team: str, stop_event: asyncio.Event):
-    """Dummy bot: always calls or checks."""
-    async with websockets.connect(url) as ws:
-        await ws.send(json.dumps({
-            "type": "register", "team": team, "invite": INVITE_CODE,
-        }))
-        reply = json.loads(await ws.recv())
-        assert reply["type"] == "registered"
-
-        while not stop_event.is_set():
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
-            except websockets.ConnectionClosed:
-                break
-
-            msg = json.loads(raw)
-            if msg["type"] == "turn":
-                valid = msg.get("valid_actions", [])
-                action = "fold"
-                amount = 0
-                for a in valid:
-                    if "call" in a:
-                        action = "call"
-                        import re
-                        m = re.search(r'(\d+)', a)
-                        amount = int(m.group(1)) if m else 0
-                        break
-                    if "check" in a:
-                        action = "check"
-                        break
-
-                await ws.send(json.dumps({
-                    "type": "action",
-                    "turn_id": msg["turn_id"],
-                    "action": action,
-                    "amount": amount,
-                }))
+    """Thin wrapper around DummyBot(strategy='always_call') for existing call sites."""
+    bot = DummyBot(url, team, INVITE_CODE, strategy="always_call")
+    await bot.run(stop_event)
 
 
 async def test_happy_path():

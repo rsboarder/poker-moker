@@ -69,87 +69,7 @@ async def http_post(path: str, body: dict | None = None) -> dict:
     return await asyncio.to_thread(_http_post_sync, path, body)
 
 
-async def dummy_bot(team: str, stop: asyncio.Event, stats: dict):
-    stats[team] = {"actions": 0, "rounds": 0, "tables_seen": set(), "connected": False, "elimination": None, "errors": 0}
-    last_turn_id = None
-    retry_count = 0
-    try:
-        async with websockets.connect(WS_URL) as ws:
-            await ws.send(json.dumps({
-                "type": "register", "team": team, "invite": "POKER-E2E",
-            }))
-            reply = json.loads(await ws.recv())
-            if reply.get("type") != "registered":
-                return
-            stats[team]["connected"] = True
-
-            while not stop.is_set():
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=0.3)
-                except asyncio.TimeoutError:
-                    continue
-                except websockets.ConnectionClosed:
-                    break
-                msg = json.loads(raw)
-                t = msg.get("type")
-
-                if t == "turn":
-                    stats[team]["actions"] += 1
-                    stats[team]["tables_seen"].add(msg.get("table_id"))
-                    valid = msg.get("valid_actions", [])
-                    stack = msg.get("stack", 0)
-                    to_call = msg.get("to_call", 0)
-                    min_raise = msg.get("min_raise", 0)
-                    turn_id = msg["turn_id"]
-
-                    # If we're spamming retries on the same turn, fall back
-                    # Note: dealer increments turn_id on each re-prompt, so detect
-                    # retries by tracking prior turn_ids we've answered for.
-                    if last_turn_id is not None and turn_id == last_turn_id + 1:
-                        retry_count += 1
-                    else:
-                        retry_count = 0
-                    last_turn_id = turn_id
-
-                    # Aggressive: shove all-in when possible
-                    raise_amt = stack + to_call
-                    can_raise = any("raise" in a for a in valid)
-
-                    if retry_count >= 2:
-                        # Fallback: plain call/check/fold
-                        if to_call == 0:
-                            action, amount = "check", 0
-                        elif to_call <= stack:
-                            action, amount = "call", to_call
-                        else:
-                            action, amount = "fold", 0
-                    elif can_raise and raise_amt >= min_raise:
-                        action, amount = "raise", raise_amt
-                    elif to_call == 0:
-                        action, amount = "check", 0
-                    elif to_call <= stack:
-                        action, amount = "call", to_call
-                    else:
-                        action, amount = "fold", 0
-
-                    await ws.send(json.dumps({
-                        "type": "action", "turn_id": turn_id,
-                        "action": action, "amount": amount,
-                    }))
-                elif t == "cards":
-                    stats[team]["rounds"] += 1
-                    last_turn_id = None
-                    retry_count = 0
-                elif t == "eliminated":
-                    stats[team]["elimination"] = msg.get("place")
-                elif t == "table_change":
-                    stats[team]["tables_seen"].add(msg.get("new_table"))
-                elif t == "error":
-                    stats[team]["errors"] += 1
-                elif t == "tournament_over":
-                    break
-    except Exception as e:
-        stats[team]["error"] = str(e)
+from test_helpers import DummyBot, spawn_dummies  # noqa: E402
 
 
 async def run():
@@ -194,13 +114,12 @@ async def run():
 
         # Connect 9 bots (expect 3 tables × 3)
         NUM_BOTS = 9
-        stats: dict = {}
         stop = asyncio.Event()
         bot_names = [f"bot{i:02d}" for i in range(1, NUM_BOTS + 1)]
-        bot_tasks = [
-            asyncio.create_task(dummy_bot(n, stop, stats))
-            for n in bot_names
-        ]
+        bots, bot_tasks = spawn_dummies(
+            WS_URL, bot_names, "POKER-E2E", stop, strategy="smart_fallback"
+        )
+        stats = {b.team: b.stats for b in bots}  # alias for downstream code
         await asyncio.sleep(0.8)
 
         connected = sum(1 for s in stats.values() if s["connected"])
