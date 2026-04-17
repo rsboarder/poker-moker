@@ -385,7 +385,7 @@ class TableSession:
                     f"--- Round {self.engine.round_number + 1} | Blinds: {sb}/{bb} "
                     f"| SB: @{sb_player} | BB: @{bb_player} ---")
 
-        btn_id = active_agents[2].player_id if len(active_agents) >= 3 else active_agents[0].player_id
+        btn_id = active_agents[-1].player_id if len(active_agents) >= 3 else active_agents[0].player_id
         with _spectator_lock:
             _spectator_state["sb_player_id"] = active_agents[0].player_id
             _spectator_state["bb_player_id"] = active_agents[1].player_id if len(active_agents) > 1 else None
@@ -495,6 +495,9 @@ class TableSession:
                     # Buffer for batched round summary; still broadcast via WS immediately
                     self._tg_buffer.append(text)
                     ws_event = self._parse_dealer_text_to_event(text)
+                    if ws_event.get("street"):
+                        with _spectator_lock:
+                            _spectator_state["last_actions"] = {}
                     await self._ws_broadcast(ws_event)
                     self._update_spectator(text)
                 else:
@@ -1359,19 +1362,29 @@ class DealerBot:
                         lines.append(f"  @{a.username}: {a.stack}")
                     await _send(self.bot, MAIN_GROUP_ID, "\n".join(lines))
 
-            # Pause between rounds (longer in spectator mode for result display)
-            with _spectator_lock:
-                if _spectator_state["spectator_mode"]:
-                    inter_round = _spectator_state["round_pause"]
-                else:
-                    inter_round = 3.0
-            await asyncio.sleep(inter_round)
+                # Pause between rounds (longer in spectator mode for result display)
+                with _spectator_lock:
+                    if _spectator_state["spectator_mode"]:
+                        inter_round = _spectator_state["round_pause"]
+                    else:
+                        inter_round = 0.0
+                await asyncio.sleep(inter_round)
 
             # Tournament over
             winner = max(agents, key=lambda a: a.stack)
             log.info("=== TOURNAMENT OVER. Winner: @%s ===", winner.username)
             await _send(self.bot, MAIN_GROUP_ID,
                         f"🏆 Tournament over!\n@{winner.username} wins with {winner.stack} chips!")
+            await table._ws_broadcast({
+                "type": "tournament_over",
+                "winner": winner.username,
+                "winner_id": winner.player_id,
+                "stack": winner.stack,
+            })
+            with _spectator_lock:
+                _spectator_state["game_state"] = "tournament_over"
+                _spectator_state["winner"] = winner.username
+                _spectator_state["timestamp"] = int(time.time())
             table.engine.state = GameState.WAITING
 
         except Exception as e:
@@ -1475,7 +1488,7 @@ async def async_main():
     # Update spectator state with TG availability
     with _spectator_lock:
         _spectator_state["tg_configured"] = TG_CONFIGURED
-        _spectator_state["tg_logging"]    = TG_CONFIGURED  # on by default if configured
+        _spectator_state["tg_logging"]    = False  # off by default; enable from control panel
 
     agents = load_agents()
     if not agents:
