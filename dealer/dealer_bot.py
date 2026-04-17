@@ -651,12 +651,15 @@ class TableSession:
         hands       = ev.data.get("hands", [])
         pot_results = ev.data.get("pots", [])
         pot         = ev.data["pot"]
+        winner_ids  = ev.data.get("winner_ids", [])
 
         def _name(pid: int) -> str:
             a = self._by_player_id.get(pid)
             return f"@{a.username}" if a else f"Player {pid}"
 
         lines = []
+
+        # Winner announcement
         if reason == "fold":
             winner_id = ev.data["winner_id"]
             lines.append(f"🏆 {_name(winner_id)} wins {pot} chips! (opponent folded)")
@@ -674,13 +677,19 @@ class TableSession:
                     wid = pr["winner_ids"][0]
                     lines.append(f"🏆 {label} ({pr['amount']}): {_name(wid)} wins")
 
-        if reason not in ("fold", "last_standing") and hands:
-            lines.append("Showdown:")
+        # Cards + combinations (only when players actually go to showdown)
+        if reason == "showdown" and hands:
+            from core.evaluator import cards_to_str
+            community = cards_to_str(self.engine.community) if self.engine.community else []
+            if community:
+                lines.append(f"Board: {' '.join(community)}")
             for h in hands:
-                name = _name(h["player_id"])
+                pid   = h["player_id"]
+                name  = _name(pid)
                 cards = " ".join(h.get("hole_cards", []))
-                rank = h.get("rank", "—")
-                lines.append(f"  {name}: {cards} — {rank}")
+                rank  = h.get("rank", "—")
+                mark  = "⭐" if pid in winner_ids else "  "
+                lines.append(f"{mark} {name}: {cards} — {rank}")
 
         return "\n".join(lines)
 
@@ -690,10 +699,10 @@ class TableSession:
             _spectator_state["showdown_result"] = {
                 "text": result_text,
                 "timestamp": int(time.time()),
-                "reason": reason,
-                "hands": hands,
-                "pots": pot_results,
-                "total_won": {str(k): v for k, v in total_won.items()},
+                "reason": ev.data.get("reason"),
+                "hands": ev.data.get("hands", []),
+                "pots": ev.data.get("pots", []),
+                "total_won": {str(k): v for k, v in ev.data.get("total_won", {}).items()},
                 "winner_id": ev.data.get("winner_id"),
                 "community": list(_spectator_state.get("community_cards", [])),
                 "players_map": {str(p["id"]): p["username"] for p in _spectator_state.get("players", [])},
