@@ -1290,10 +1290,9 @@ async def async_main():
     """
     agents = load_agents()
     if not agents:
-        log.error("No agents configured. Check your .env file.")
-        sys.exit(1)
-
-    log.info("Loaded %d agent(s): %s", len(agents), [a.username for a in agents])
+        log.warning("No pre-configured agents. Waiting for WS connections before /startgame.")
+    else:
+        log.info("Loaded %d agent(s): %s", len(agents), [a.username for a in agents])
 
     dealer = DealerBot(agents)
     app = _build_app(dealer)
