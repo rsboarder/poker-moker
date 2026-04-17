@@ -894,6 +894,10 @@ class DealerBot:
         # Per-bot auth tokens: username → token (issued at registration)
         self._ws_tokens: dict[str, str] = {}
 
+        # Track which players have had their elimination announced (by player_id).
+        # Cleared on tournament start/stop.
+        self._eliminated_announced: set[int] = set()
+
     def _find_table_for_user(self, username: str) -> "TableSession | None":
         """Return the TableSession where this username is a player."""
         username_lc = username.lower()
@@ -1155,6 +1159,7 @@ class DealerBot:
         self.tables = {}
         self._table_tasks.clear()
         self._global_round_count = 0
+        self._eliminated_announced.clear()
         for tid, seated in seats_per_table.items():
             self.tables[tid] = TableSession(
                 table_id=tid, agents=seated, bot=self.bot,
@@ -1219,6 +1224,7 @@ class DealerBot:
         log.info("=== TOURNAMENT STOPPED via HTTP ===")
         self.tables.clear()
         self._global_round_count = 0
+        self._eliminated_announced.clear()
         with _spectator_lock:
             _spectator_state["game_state"] = "waiting"
             _spectator_state["street"] = "waiting"
@@ -1584,13 +1590,12 @@ class DealerBot:
 
         # Announce eliminations for players who just went out
         for a in agents:
-            if a.stack == 0 and getattr(a, "_announced_out", False) is False:
-                a._announced_out = True  # type: ignore[attr-defined]
+            if a.stack == 0 and a.player_id not in self._eliminated_announced:
+                self._eliminated_announced.add(a.player_id)
                 await _send(self.bot, MAIN_GROUP_ID, f"💀 @{a.username} is eliminated!")
                 ws = self.ws_connections.get(a.username.lower())
                 if ws:
                     try:
-                        place = len(agents) - sum(1 for x in agents if x.stack == 0) + 1
                         await ws.send(json.dumps({
                             "type": "eliminated",
                             "place": len([x for x in agents if x.stack == 0]),
