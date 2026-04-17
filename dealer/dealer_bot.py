@@ -372,6 +372,14 @@ class TableSession:
         self._turn_id: int = 0
         self._tg_buffer: list[str] = []  # accumulates per-round lines for one batched TG message
 
+        # Per-table spectator state (lifted out of the flat _spectator_state root so
+        # multiple tables don't clobber each other's blind positions / last actions).
+        self.last_actions: dict[int, str] = {}
+        self.showdown_result: dict | None = None
+        self.sb_player_id: int | None = None
+        self.bb_player_id: int | None = None
+        self.btn_player_id: int | None = None
+
     def _tg_prefix(self) -> str:
         """Return '[Tn] ' prefix when multi-table, empty otherwise. Decided from spectator state."""
         with _spectator_lock:
@@ -392,8 +400,7 @@ class TableSession:
         self._received_action = (action, amount)
         self._action_event.set()
         action_str = f"raise {amount}" if action == "raise" else action
-        with _spectator_lock:
-            _spectator_state["last_actions"][self._pending_player_id] = action_str
+        self.last_actions[self._pending_player_id] = action_str
         return True
 
     async def run_single_round(self, active_agents: list, sb: int, bb: int):
@@ -416,12 +423,12 @@ class TableSession:
         )
 
         btn_id = active_agents[-1].player_id if len(active_agents) >= 3 else active_agents[0].player_id
-        with _spectator_lock:
-            _spectator_state["sb_player_id"] = active_agents[0].player_id
-            _spectator_state["bb_player_id"] = active_agents[1].player_id if len(active_agents) > 1 else None
-            _spectator_state["btn_player_id"] = btn_id
-            _spectator_state["last_actions"] = {}
-            _spectator_state["showdown_result"] = None
+        # Per-table state — will be merged into spectator snapshot in _update_spectator().
+        self.sb_player_id = active_agents[0].player_id
+        self.bb_player_id = active_agents[1].player_id if len(active_agents) > 1 else None
+        self.btn_player_id = btn_id
+        self.last_actions = {}
+        self.showdown_result = None
 
         events = self.engine.start_round(players_data)
         log.info("[T%d] Round %d started. State: %s. Events: %d",
@@ -451,8 +458,7 @@ class TableSession:
                     action = "fold"
                     log.warning("[T%d] Timeout: @%s auto-folded", self.table_id, agent.username)
                     await self._tg_send(f"⏱️ @{agent.username} timed out — auto-fold.")
-                with _spectator_lock:
-                    _spectator_state["last_actions"][self._pending_player_id] = f"{action} (timeout)"
+                self.last_actions[self._pending_player_id] = f"{action} (timeout)"
                 # Prevent runaway loop when multiple bots disconnect
                 await asyncio.sleep(0.5)
 
@@ -524,8 +530,7 @@ class TableSession:
                     self._tg_buffer.append(text)
                     ws_event = self._parse_dealer_text_to_event(text)
                     if ws_event.get("street"):
-                        with _spectator_lock:
-                            _spectator_state["last_actions"] = {}
+                        self.last_actions = {}
                     await self._ws_broadcast(ws_event)
                     self._update_spectator(text)
                 else:
@@ -765,7 +770,7 @@ class TableSession:
 
         community = cards_to_str(eng.community) if eng.community else []
 
-        # Per-table snapshot for multi-table overview
+        # Per-table snapshot (authoritative for multi-table overview / focused-table views)
         table_snapshot = {
             "table_id": self.table_id,
             "game_state": eng.state.value,
@@ -776,29 +781,44 @@ class TableSession:
             "players": players_out,
             "current_player": self._pending_player_id,
             "blinds": {"sb": eng.small_blind, "bb": eng.big_blind},
+            "sb_player_id": self.sb_player_id,
+            "bb_player_id": self.bb_player_id,
+            "btn_player_id": self.btn_player_id,
+            "last_actions": dict(self.last_actions),
+            "showdown_result": self.showdown_result,
         }
 
         with _spectator_lock:
-            # Per-table state (for overview UI)
+            # Per-table state (authoritative)
             tables_state = _spectator_state.setdefault("tables", {})
             if not isinstance(tables_state, dict):
                 tables_state = {}
                 _spectator_state["tables"] = tables_state
             tables_state[str(self.table_id)] = table_snapshot
 
-            # Flat fields — updated for any table (used by legacy single-table UI)
-            # For multi-table, UI should read from state["tables"] instead
-            _spectator_state["game_state"] = eng.state.value
-            _spectator_state["round_number"] = eng.round_number
-            _spectator_state["street"] = eng.state.value
-            _spectator_state["pot"] = eng.pot
-            _spectator_state["community_cards"] = community
-            _spectator_state["players"] = players_out
-            _spectator_state["current_player"] = self._pending_player_id
-            _spectator_state["blinds"] = {"sb": eng.small_blind, "bb": eng.big_blind}
+            # Flat fields — populated ONLY in single-table mode so the legacy UI
+            # (control.html, single-table spectator fallback) keeps working.
+            # In multi-table mode, UI must read from state["tables"][tid].
+            is_single = int(_spectator_state.get("table_count", 0)) <= 1
+            if is_single:
+                _spectator_state["game_state"] = eng.state.value
+                _spectator_state["round_number"] = eng.round_number
+                _spectator_state["street"] = eng.state.value
+                _spectator_state["pot"] = eng.pot
+                _spectator_state["community_cards"] = community
+                _spectator_state["players"] = players_out
+                _spectator_state["current_player"] = self._pending_player_id
+                _spectator_state["blinds"] = {"sb": eng.small_blind, "bb": eng.big_blind}
+                _spectator_state["sb_player_id"] = self.sb_player_id
+                _spectator_state["bb_player_id"] = self.bb_player_id
+                _spectator_state["btn_player_id"] = self.btn_player_id
+                _spectator_state["last_actions"] = dict(self.last_actions)
+                _spectator_state["showdown_result"] = self.showdown_result
+
             _spectator_state["timestamp"] = int(time.time())
             if event_text:
-                _spectator_state["recent_events"].append(f"[T{self.table_id}] {event_text}")
+                prefix = f"[T{self.table_id}] " if not is_single else ""
+                _spectator_state["recent_events"].append(f"{prefix}{event_text}")
                 _spectator_state["recent_events"] = _spectator_state["recent_events"][-30:]
 
     def _format_showdown(self, ev: GameEvent) -> str:
@@ -850,18 +870,28 @@ class TableSession:
 
     async def _send_showdown(self, ev: GameEvent):
         result_text = self._format_showdown(ev)
+        from core.evaluator import cards_to_str
+        community = cards_to_str(self.engine.community) if self.engine.community else []
+        players_map = {
+            str(p.id): (self._by_player_id.get(p.id).username if self._by_player_id.get(p.id) else f"Player {p.id}")
+            for p in self.engine.players
+        }
+        snapshot = {
+            "text": result_text,
+            "timestamp": int(time.time()),
+            "reason": ev.data.get("reason"),
+            "hands": ev.data.get("hands", []),
+            "pots": ev.data.get("pots", []),
+            "total_won": {str(k): v for k, v in ev.data.get("total_won", {}).items()},
+            "winner_id": ev.data.get("winner_id"),
+            "community": community,
+            "players_map": players_map,
+        }
+        self.showdown_result = snapshot
         with _spectator_lock:
-            _spectator_state["showdown_result"] = {
-                "text": result_text,
-                "timestamp": int(time.time()),
-                "reason": ev.data.get("reason"),
-                "hands": ev.data.get("hands", []),
-                "pots": ev.data.get("pots", []),
-                "total_won": {str(k): v for k, v in ev.data.get("total_won", {}).items()},
-                "winner_id": ev.data.get("winner_id"),
-                "community": list(_spectator_state.get("community_cards", [])),
-                "players_map": {str(p["id"]): p["username"] for p in _spectator_state.get("players", [])},
-            }
+            is_single = int(_spectator_state.get("table_count", 0)) <= 1
+            if is_single:
+                _spectator_state["showdown_result"] = snapshot
 
     def _is_connected(self, agent: AgentInfo) -> bool:
         """Check if agent has an active WS connection."""

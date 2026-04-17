@@ -688,14 +688,18 @@ function renderShowdown(result) {
 // ── State hash ───────────────────────────────────────────
 function hashState(s) {
   if (!s) return '';
-  // For multi-table, include each table's state
+  // For multi-table, include each table's per-table state including sb/bb/btn/last_actions
   const tablesHash = {};
   if (s.tables) {
     for (const tid of Object.keys(s.tables)) {
       const t = s.tables[tid];
-      tablesHash[tid] = `${t.pot}|${t.street}|${t.round_number}|${t.current_player}|` +
+      tablesHash[tid] =
+        `${t.pot}|${t.street}|${t.round_number}|${t.current_player}|` +
+        `${t.sb_player_id}|${t.bb_player_id}|${t.btn_player_id}|` +
         (t.community_cards || []).join(',') + '|' +
-        (t.players || []).map(p => `${p.id}:${p.stack}:${p.street_bet}:${p.status}`).join(';');
+        (t.players || []).map(p => `${p.id}:${p.stack}:${p.street_bet}:${p.status}`).join(';') + '|' +
+        JSON.stringify(t.last_actions || {}) + '|' +
+        (t.showdown_result?.timestamp || '');
     }
   }
   return JSON.stringify({
@@ -862,14 +866,15 @@ function update(state) {
   renderPlayers(
     viewState?.players || [],
     viewState?.current_player ?? null,
-    // sb/bb/btn come from flat state (table-level snapshot doesn't include them yet)
-    state?.sb_player_id   ?? null,
-    state?.bb_player_id   ?? null,
-    state?.btn_player_id  ?? null,
-    state?.last_actions   || {}
+    // sb/bb/btn and last_actions live in the per-table snapshot now (fall back to flat
+    // state only in single-table mode for backward compat)
+    viewState?.sb_player_id   ?? state?.sb_player_id   ?? null,
+    viewState?.bb_player_id   ?? state?.bb_player_id   ?? null,
+    viewState?.btn_player_id  ?? state?.btn_player_id  ?? null,
+    viewState?.last_actions   ?? state?.last_actions   ?? {}
   );
   renderLog(state?.recent_events || [], viewState?.players);
-  renderShowdown(state?.showdown_result || null);
+  renderShowdown(viewState?.showdown_result ?? state?.showdown_result ?? null);
 }
 
 // ── Polling ──────────────────────────────────────────────
