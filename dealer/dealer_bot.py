@@ -19,7 +19,9 @@ import asyncio
 import json
 import logging
 import logging.handlers
+import math
 import os
+import random
 import re
 import secrets
 import signal
@@ -74,6 +76,9 @@ _spectator_state: dict = {
     "spectator_mode": False, # slow down game for human viewers
     "action_delay": 2.0,     # seconds to wait after each player action
     "round_pause": 10.0,     # seconds to pause between rounds
+    "table_size": 6,         # players per table (overridable via /spectator-config)
+    "tables": {},            # per-table state for multi-table mode: {table_id: {...}}
+    "table_count": 0,        # number of active tables
 }
 _spectator_lock = threading.Lock()
 
@@ -142,14 +147,23 @@ class _SpectatorHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             with _spectator_lock:
+                game_active = _spectator_state.get("table_count", 0) > 0
                 if "action_delay" in body:
                     _spectator_state["action_delay"] = max(0.0, float(body["action_delay"]))
                 if "round_pause" in body:
                     _spectator_state["round_pause"] = max(0.0, float(body["round_pause"]))
+                if "table_size" in body:
+                    if game_active:
+                        self._send_json(400, {"error": "cannot change table_size while game is running"})
+                        return
+                    size = int(body["table_size"])
+                    size = max(TABLE_SIZE_MIN, min(size, TABLE_SIZE_MAX))
+                    _spectator_state["table_size"] = size
                 result = {
                     "ok": True,
                     "action_delay": _spectator_state["action_delay"],
                     "round_pause": _spectator_state["round_pause"],
+                    "table_size": _spectator_state["table_size"],
                 }
             log.info("Spectator config updated: %s", result)
             self._send_json(200, result)
@@ -227,6 +241,9 @@ TG_CONFIGURED      = bool(DEALER_BOT_TOKEN and MAIN_GROUP_ID)
 ACTION_TIMEOUT     = float(os.getenv("ACTION_TIMEOUT_SECONDS", "5"))
 STARTING_STACK     = int(os.getenv("STARTING_STACK", "1000"))
 WS_PORT            = int(os.getenv("WS_PORT", "9000"))
+TABLE_SIZE_DEFAULT = int(os.getenv("TABLE_SIZE", "6"))
+TABLE_SIZE_MIN     = 2
+TABLE_SIZE_MAX     = 10
 
 # Comma-separated Telegram user IDs allowed to run admin commands
 _admin_ids_raw = os.getenv("ADMIN_USER_IDS", "")
@@ -353,6 +370,16 @@ class TableSession:
         self._turn_id: int = 0
         self._tg_buffer: list[str] = []  # accumulates per-round lines for one batched TG message
 
+    def _tg_prefix(self) -> str:
+        """Return '[Tn] ' prefix when multi-table, empty otherwise. Decided from spectator state."""
+        with _spectator_lock:
+            n = int(_spectator_state.get("table_count", 0))
+        return f"[T{self.table_id}] " if n > 1 else ""
+
+    async def _tg_send(self, text: str):
+        """Send to TG with table prefix when multi-table."""
+        await _send(self.bot, MAIN_GROUP_ID, self._tg_prefix() + text)
+
     def accept_action(self, sender_username: str, action: str, amount: int) -> bool:
         """Try to accept an action from a Telegram message. Returns True if accepted."""
         if not self._pending_player_id:
@@ -381,9 +408,10 @@ class TableSession:
 
         sb_player = active_agents[0].username
         bb_player = active_agents[1].username
-        await _send(self.bot, MAIN_GROUP_ID,
-                    f"--- Round {self.engine.round_number + 1} | Blinds: {sb}/{bb} "
-                    f"| SB: @{sb_player} | BB: @{bb_player} ---")
+        await self._tg_send(
+            f"--- Round {self.engine.round_number + 1} | Blinds: {sb}/{bb} "
+            f"| SB: @{sb_player} | BB: @{bb_player} ---"
+        )
 
         btn_id = active_agents[-1].player_id if len(active_agents) >= 3 else active_agents[0].player_id
         with _spectator_lock:
@@ -416,13 +444,11 @@ class TableSession:
                 if to_call == 0:
                     action = "check"
                     log.warning("[T%d] Timeout: @%s auto-checked", self.table_id, agent.username)
-                    await _send(self.bot, MAIN_GROUP_ID,
-                                f"⏱️ @{agent.username} timed out — auto-check.")
+                    await self._tg_send(f"⏱️ @{agent.username} timed out — auto-check.")
                 else:
                     action = "fold"
                     log.warning("[T%d] Timeout: @%s auto-folded", self.table_id, agent.username)
-                    await _send(self.bot, MAIN_GROUP_ID,
-                                f"⏱️ @{agent.username} timed out — auto-fold.")
+                    await self._tg_send(f"⏱️ @{agent.username} timed out — auto-fold.")
                 with _spectator_lock:
                     _spectator_state["last_actions"][self._pending_player_id] = f"{action} (timeout)"
                 # Prevent runaway loop when multiple bots disconnect
@@ -440,7 +466,7 @@ class TableSession:
             if len(events) == 1 and events[0].type == "error":
                 error_text = events[0].data.get("text", "Invalid action.")
                 log.warning("[T%d] Engine rejected action: %s", self.table_id, error_text)
-                await _send(self.bot, MAIN_GROUP_ID, f"❌ {error_text}")
+                await self._tg_send(f"❌ {error_text}")
                 agent = self._by_player_id.get(self._pending_player_id)
                 if agent:
                     p = self.engine.players[self.engine.current_idx]
@@ -465,7 +491,7 @@ class TableSession:
                 f"@{a.username}: {a.stack}" for a in self.agents
             )
             self._tg_buffer.append(stacks_line)
-            await _send(self.bot, MAIN_GROUP_ID, "\n".join(self._tg_buffer))
+            await self._tg_send("\n".join(self._tg_buffer))
             self._tg_buffer.clear()
 
         # Send round_end to all WS bots
@@ -729,7 +755,29 @@ class TableSession:
 
         community = cards_to_str(eng.community) if eng.community else []
 
+        # Per-table snapshot for multi-table overview
+        table_snapshot = {
+            "table_id": self.table_id,
+            "game_state": eng.state.value,
+            "round_number": eng.round_number,
+            "street": eng.state.value,
+            "pot": eng.pot,
+            "community_cards": community,
+            "players": players_out,
+            "current_player": self._pending_player_id,
+            "blinds": {"sb": eng.small_blind, "bb": eng.big_blind},
+        }
+
         with _spectator_lock:
+            # Per-table state (for overview UI)
+            tables_state = _spectator_state.setdefault("tables", {})
+            if not isinstance(tables_state, dict):
+                tables_state = {}
+                _spectator_state["tables"] = tables_state
+            tables_state[str(self.table_id)] = table_snapshot
+
+            # Flat fields — updated for any table (used by legacy single-table UI)
+            # For multi-table, UI should read from state["tables"] instead
             _spectator_state["game_state"] = eng.state.value
             _spectator_state["round_number"] = eng.round_number
             _spectator_state["street"] = eng.state.value
@@ -740,7 +788,7 @@ class TableSession:
             _spectator_state["blinds"] = {"sb": eng.small_blind, "bb": eng.big_blind}
             _spectator_state["timestamp"] = int(time.time())
             if event_text:
-                _spectator_state["recent_events"].append(event_text)
+                _spectator_state["recent_events"].append(f"[T{self.table_id}] {event_text}")
                 _spectator_state["recent_events"] = _spectator_state["recent_events"][-30:]
 
     def _format_showdown(self, ev: GameEvent) -> str:
@@ -827,11 +875,20 @@ class DealerBot:
         self._by_player_id: dict[int, AgentInfo] = {a.player_id: a for a in agents}
         self._by_username:  dict[str, AgentInfo] = {a.username.lower(): a for a in agents}
 
-        # Active table session (single table for now; will become dict for multi-table)
-        self.table: TableSession | None = None
+        # Active tables (multi-table): table_id -> TableSession
+        self.tables: dict[int, TableSession] = {}
+        # Per-table asyncio tasks
+        self._table_tasks: dict[int, asyncio.Task] = {}
+        # Main tournament coordinator task (spawns/joins table tasks)
+        self._tournament_task: asyncio.Task | None = None
+        # Global round counter across ALL tables (drives blind schedule)
+        self._global_round_count: int = 0
+        # Active table size for current tournament (frozen at start)
+        self._table_size: int = TABLE_SIZE_DEFAULT
 
-        # Keep task reference to prevent GC
-        self._round_task: asyncio.Task | None = None
+        # Legacy alias for single-table access (first table or None)
+        # Kept for backward compat with HTTP /state, /status, etc.
+        self._legacy_single_table_id: int | None = None
 
         # Will be set after Application is built
         self.bot: Bot | None = None
@@ -840,6 +897,33 @@ class DealerBot:
         self.ws_connections: dict[str, websockets.WebSocketServerProtocol] = {}
         # Per-bot auth tokens: username → token (issued at registration)
         self._ws_tokens: dict[str, str] = {}
+
+    @property
+    def table(self) -> "TableSession | None":
+        """Legacy: returns the "focused" table (first one) or None.
+        Used by handlers that need to find which table an action belongs to."""
+        if not self.tables:
+            return None
+        return next(iter(self.tables.values()))
+
+    def _find_table_for_user(self, username: str) -> "TableSession | None":
+        """Return the TableSession where this username is a player."""
+        username_lc = username.lower()
+        for t in self.tables.values():
+            for agent in t.agents:
+                if agent.username.lower() == username_lc:
+                    return t
+        return None
+
+    def _is_game_active(self) -> bool:
+        """Tournament is active if the coordinator task is still running.
+        (Individual table states flicker through SHOWDOWN between rounds.)"""
+        if self._tournament_task and not self._tournament_task.done():
+            return True
+        # Also consider active if any table task is running
+        if any(not t.done() for t in self._table_tasks.values()):
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # WebSocket handler
@@ -953,7 +1037,13 @@ class DealerBot:
             await ws.send(json.dumps({"type": "error", "text": f"invalid action: {action}"}))
             return
 
-        accepted = self.table.accept_action(username, action, amount)
+        # Find the table this user belongs to
+        target_table = self._find_table_for_user(username)
+        if not target_table:
+            await ws.send(json.dumps({"type": "error", "text": "you are not seated at any table"}))
+            return
+
+        accepted = target_table.accept_action(username, action, amount)
         if not accepted:
             await ws.send(json.dumps({"type": "error", "text": "not your turn"}))
 
@@ -967,16 +1057,14 @@ class DealerBot:
         if not _is_admin(update):
             await update.message.reply_text("⚠️ Only admins can start the game.")
             return
-        if self.table and self.table.engine.state not in (GameState.WAITING, GameState.SHOWDOWN):
-            await update.message.reply_text("❌ A round is already in progress.")
+        if self._is_game_active():
+            await update.message.reply_text("❌ A tournament is already in progress.")
             return
 
         # Build roster from WS-connected bots (primary) + Telegram-registered (fallback)
         ws_usernames = set(self.ws_connections.keys())
         tg_usernames = {a.username.lower() for a in self.agents}
 
-        # If WS bots are connected, use only WS bots (they are the real players).
-        # Telegram-registered bots without WS connection would just timeout.
         if ws_usernames:
             player_usernames = ws_usernames
             source = "WS"
@@ -990,37 +1078,21 @@ class DealerBot:
                 f"WS: {len(ws_usernames)}, Telegram: {len(tg_usernames)}")
             return
 
-        # Freeze roster
-        self._tournament_agents = []
-        pid = 1
-        for username in sorted(player_usernames):
-            tg_agent = self._by_username.get(username)
-            self._tournament_agents.append(AgentInfo(
-                player_id=pid,
-                username=username,
-                private_group_id=tg_agent.private_group_id if tg_agent else 0,
-                stack=STARTING_STACK,
-                ready_message_id=tg_agent.ready_message_id if tg_agent else None,
-            ))
-            pid += 1
-
-        self.table = TableSession(
-            table_id=1, agents=self._tournament_agents, bot=self.bot,
-            ws_connections=self.ws_connections,
-        )
-
-        log.info("=== TOURNAMENT START: %d players (%s) stacks=%d ===",
-                 len(self._tournament_agents), source, STARTING_STACK)
+        agents = self._build_tournament_agents(sorted(player_usernames))
+        table_size, num_tables = self._seat_and_init_tables(agents)
 
         sb, bb = get_blinds(1)
-        players_str = ", ".join(f"@{a.username}" for a in self._tournament_agents)
+        players_str = ", ".join(f"@{a.username}" for a in agents)
+        log.info("=== TOURNAMENT START: %d players (%s), %d table(s) of %d ===",
+                 len(agents), source, num_tables, table_size)
         await update.message.reply_text(
             f"🏆 AICollective AI Agents Poker — Tournament\n"
             f"Players: {players_str}\n"
+            f"Tables: {num_tables} × {table_size}\n"
             f"Starting stack: {STARTING_STACK} chips\n"
             f"Blinds: {sb}/{bb}"
         )
-        self._round_task = asyncio.create_task(self._run_tournament())
+        self._tournament_task = asyncio.create_task(self._run_tournament())
 
     async def cmd_stopgame(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.id != MAIN_GROUP_ID:
@@ -1029,19 +1101,105 @@ class DealerBot:
             await update.message.reply_text("⚠️ Only admins can stop the game.")
             return
 
-        if self._round_task and not self._round_task.done():
-            self._round_task.cancel()
-            log.info("=== TOURNAMENT STOPPED by @%s ===",
-                     update.effective_user.username if update.effective_user else "unknown")
-
-        # Unblock any pending action wait so the cancelled task exits cleanly
-        if self.table:
-            self.table.stop()
-            self.table.engine.state = GameState.WAITING
+        await self._stop_all_tables()
+        log.info("=== TOURNAMENT STOPPED by @%s ===",
+                 update.effective_user.username if update.effective_user else "unknown")
 
         await update.message.reply_text(
             "🛑 Tournament stopped. Send /startgame to start a new one."
         )
+
+    async def _stop_all_tables(self):
+        """Cancel all table tasks and tournament coordinator, stop all TableSessions."""
+        if self._tournament_task and not self._tournament_task.done():
+            self._tournament_task.cancel()
+        for task in self._table_tasks.values():
+            if not task.done():
+                task.cancel()
+        for t in self.tables.values():
+            t.stop()
+            t.engine.state = GameState.WAITING
+        self._table_tasks.clear()
+        self._tournament_task = None
+
+    # ------------------------------------------------------------------
+    # Multi-table helpers
+    # ------------------------------------------------------------------
+
+    def _build_tournament_agents(self, usernames: list[str]) -> list[AgentInfo]:
+        """Create AgentInfo objects for all tournament players, freezing roster."""
+        self._tournament_agents = []
+        for pid, username in enumerate(usernames, start=1):
+            tg_agent = self._by_username.get(username)
+            self._tournament_agents.append(AgentInfo(
+                player_id=pid,
+                username=username,
+                private_group_id=tg_agent.private_group_id if tg_agent else 0,
+                stack=STARTING_STACK,
+                ready_message_id=tg_agent.ready_message_id if tg_agent else None,
+            ))
+        return self._tournament_agents
+
+    def _seat_and_init_tables(self, agents: list[AgentInfo]) -> tuple[int, int]:
+        """Randomly seat agents across N tables. Creates TableSession for each.
+        Returns (table_size, num_tables).
+        """
+        with _spectator_lock:
+            table_size = max(TABLE_SIZE_MIN, min(int(_spectator_state.get("table_size", TABLE_SIZE_DEFAULT)), TABLE_SIZE_MAX))
+        self._table_size = table_size
+
+        n = len(agents)
+        num_tables = max(1, math.ceil(n / table_size))
+        # But don't create more tables than needed for even distribution
+        # Prefer fuller tables: ceil(n / table_size) is usually right
+
+        # Random seating
+        shuffled = list(agents)
+        random.shuffle(shuffled)
+
+        # Distribute round-robin to balance table sizes
+        seats_per_table: dict[int, list[AgentInfo]] = {i + 1: [] for i in range(num_tables)}
+        for i, agent in enumerate(shuffled):
+            tid = (i % num_tables) + 1
+            seats_per_table[tid].append(agent)
+
+        # Create TableSessions
+        self.tables = {}
+        self._table_tasks.clear()
+        self._global_round_count = 0
+        for tid, seated in seats_per_table.items():
+            self.tables[tid] = TableSession(
+                table_id=tid, agents=seated, bot=self.bot,
+                ws_connections=self.ws_connections,
+            )
+            log.info("[T%d] seated: %s", tid, [a.username for a in seated])
+
+        self._legacy_single_table_id = 1 if self.tables else None
+
+        with _spectator_lock:
+            _spectator_state["table_count"] = len(self.tables)
+            _spectator_state["tables"] = {
+                str(tid): {"players": [a.username for a in t.agents]}
+                for tid, t in self.tables.items()
+            }
+
+        return table_size, num_tables
+
+    async def _notify_tournament_start(self):
+        """Send tournament_start message to each WS bot with their table assignment."""
+        for tid, table in self.tables.items():
+            for agent in table.agents:
+                ws = self.ws_connections.get(agent.username.lower())
+                if ws:
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "tournament_start",
+                            "players": len(self._tournament_agents),
+                            "tables": len(self.tables),
+                            "your_table": tid,
+                        }))
+                    except Exception:
+                        pass
 
     # ------------------------------------------------------------------
     # HTTP control API (called from spectator server thread via run_coroutine_threadsafe)
@@ -1051,42 +1209,30 @@ class DealerBot:
         ws_usernames = set(self.ws_connections.keys())
         if len(ws_usernames) < 2:
             return {"ok": False, "error": f"Need at least 2 players, {len(ws_usernames)} connected"}
-        if self.table and self.table.engine.state not in (GameState.WAITING, GameState.SHOWDOWN):
+        if self._is_game_active():
             return {"ok": False, "error": "Tournament already in progress"}
 
-        self._tournament_agents = []
-        for pid, username in enumerate(sorted(ws_usernames), start=1):
-            tg_agent = self._by_username.get(username)
-            self._tournament_agents.append(AgentInfo(
-                player_id=pid,
-                username=username,
-                private_group_id=tg_agent.private_group_id if tg_agent else 0,
-                stack=STARTING_STACK,
-            ))
+        agents = self._build_tournament_agents(sorted(ws_usernames))
+        table_size, num_tables = self._seat_and_init_tables(agents)
 
-        self.table = TableSession(
-            table_id=1, agents=self._tournament_agents, bot=self.bot,
-            ws_connections=self.ws_connections,
-        )
         sb, bb = get_blinds(1)
-        log.info("=== TOURNAMENT START via HTTP: %d players stacks=%d ===",
-                 len(self._tournament_agents), STARTING_STACK)
-        self._round_task = asyncio.create_task(self._run_tournament())
+        log.info("=== TOURNAMENT START via HTTP: %d players, %d table(s) of %d ===",
+                 len(agents), num_tables, table_size)
+        self._tournament_task = asyncio.create_task(self._run_tournament())
         return {
             "ok": True,
-            "players": [a.username for a in self._tournament_agents],
+            "players": [a.username for a in agents],
+            "tables": num_tables,
+            "table_size": table_size,
             "blinds": f"{sb}/{bb}",
             "starting_stack": STARTING_STACK,
         }
 
     async def trigger_stopgame(self) -> dict:
-        if self._round_task and not self._round_task.done():
-            self._round_task.cancel()
-            log.info("=== TOURNAMENT STOPPED via HTTP ===")
-        if self.table:
-            self.table.stop()
-        self.table = None
-        self._round_task = None
+        await self._stop_all_tables()
+        log.info("=== TOURNAMENT STOPPED via HTTP ===")
+        self.tables.clear()
+        self._global_round_count = 0
         with _spectator_lock:
             _spectator_state["game_state"] = "waiting"
             _spectator_state["street"] = "waiting"
@@ -1096,6 +1242,8 @@ class DealerBot:
             _spectator_state["current_player"] = None
             _spectator_state["showdown_result"] = None
             _spectator_state["last_actions"] = {}
+            _spectator_state["tables"] = {}
+            _spectator_state["table_count"] = 0
             _spectator_state["timestamp"] = int(time.time())
         return {"ok": True}
 
@@ -1229,23 +1377,21 @@ class DealerBot:
             log.info("Agent @%s ready (msg_id=%d)", agent.username, msg.message_id)
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.table:
-            await update.message.reply_text("Game not started. Use /startgame.")
-            return
-        state = self.table.engine.public_state()
-        if state["state"] == "waiting":
+        if not self.tables:
             await update.message.reply_text("Game not started. Use /startgame.")
             return
 
-        lines = [f"Street: {state['state']} | Pot: {state['pot']}"]
-        if state["community_cards"]:
-            lines.append(f"Board: {' '.join(state['community_cards'])}")
-        lines.append("")
-        for p in state["players"]:
-            agent = self.table._by_player_id.get(p["id"])
-            name = f"@{agent.username}" if agent else f"Player {p['id']}"
-            marker = " ◀ turn" if state["active_player"] == p["id"] else ""
-            lines.append(f"{name}: stack={p['stack']} bet={p['street_bet']} [{p['status']}]{marker}")
+        lines = [f"Tournament: {len(self.tables)} active table(s)"]
+        for tid, table in sorted(self.tables.items()):
+            state = table.engine.public_state()
+            lines.append(f"\n── Table {tid} ({state['state']}, pot {state['pot']}) ──")
+            if state["community_cards"]:
+                lines.append(f"Board: {' '.join(state['community_cards'])}")
+            for p in state["players"]:
+                agent = table._by_player_id.get(p["id"])
+                name = f"@{agent.username}" if agent else f"Player {p['id']}"
+                marker = " ◀ turn" if state["active_player"] == p["id"] else ""
+                lines.append(f"  {name}: stack={p['stack']} bet={p['street_bet']} [{p['status']}]{marker}")
 
         await update.message.reply_text("\n".join(lines))
 
@@ -1273,13 +1419,18 @@ class DealerBot:
         await self._accept_action(update, "raise", amount)
 
     async def _accept_action(self, update: Update, action: str, amount: int):
-        """Shared validation + dispatch for all action commands. Routes to active table."""
+        """Shared validation + dispatch for all action commands. Routes to correct table."""
         msg = update.message
-        if not msg or not self.table:
+        if not msg or not self.tables:
             return
         sender_username = (msg.from_user.username or "").lower() if msg.from_user else ""
 
-        if not self.table.accept_action(sender_username, action, amount):
+        target = self._find_table_for_user(sender_username)
+        if not target:
+            await msg.reply_text("⚠️ You are not in this tournament.")
+            return
+
+        if not target.accept_action(sender_username, action, amount):
             await msg.reply_text("⚠️ It's not your turn.")
 
     async def on_group_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1288,13 +1439,16 @@ class DealerBot:
         Accepts plain text like '/call', '/raise 100' as a reply to dealer's message.
         """
         msg = update.message
-        if not msg or not self.table or not self.table._pending_player_id:
-            return
-
-        if not msg.reply_to_message or msg.reply_to_message.message_id != self.table._pending_message_id:
+        if not msg or not self.tables:
             return
 
         sender_username = (msg.from_user.username or "").lower() if msg.from_user else ""
+        target = self._find_table_for_user(sender_username)
+        if not target or not target._pending_player_id:
+            return
+        if not msg.reply_to_message or msg.reply_to_message.message_id != target._pending_message_id:
+            return
+
         action, amount = _parse_command(msg.text or "")
         if not action:
             await msg.reply_text(
@@ -1302,7 +1456,7 @@ class DealerBot:
             )
             return
 
-        if not self.table.accept_action(sender_username, action, amount):
+        if not target.accept_action(sender_username, action, amount):
             await msg.reply_text("⚠️ It's not your turn.")
 
     # ------------------------------------------------------------------
@@ -1310,89 +1464,257 @@ class DealerBot:
     # ------------------------------------------------------------------
 
     async def _run_tournament(self):
-        """Main tournament loop — runs rounds until one player remains.
-        Uses self.table (TableSession created at /startgame).
+        """Multi-table tournament coordinator.
+        Starts one asyncio task per table. Handles table breaking, blind clock,
+        and final table consolidation. Runs until one player remains across all tables.
         """
         try:
-            table = self.table
             agents = self._tournament_agents
+
+            # Notify WS bots of their table assignment
+            await self._notify_tournament_start()
+
+            # Set initial blinds on all tables
             current_sb, current_bb = get_blinds(1)
-            table.engine.set_blinds(current_sb, current_bb)
-            dealer_idx = 0
+            for t in self.tables.values():
+                t.engine.set_blinds(current_sb, current_bb)
 
-            while True:
-                active = [a for a in agents if a.stack > 0]
+            # Start one task per table
+            for tid, table in self.tables.items():
+                task = asyncio.create_task(self._run_table_loop(tid))
+                self._table_tasks[tid] = task
 
-                if len(active) < 2:
+            # Main coordinator loop — waits for tables to finish, handles breaking/final
+            while self._table_tasks:
+                done, _pending = await asyncio.wait(
+                    list(self._table_tasks.values()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Remove completed tasks from dict
+                for task in done:
+                    finished_tid = next(
+                        (tid for tid, t in self._table_tasks.items() if t is task), None
+                    )
+                    if finished_tid is not None:
+                        self._table_tasks.pop(finished_tid, None)
+
+                # After a table finishes, re-balance (break tables, form final table)
+                await self._handle_table_breaking()
+
+                # If we've consolidated to one table that's still running, continue
+                # the wait. If all tables are done and no survivors → tournament over.
+                alive = [a for a in agents if a.stack > 0]
+                if len(alive) <= 1:
                     break
 
-                new_sb, new_bb = get_blinds(table.engine.round_number + 1)
-                if new_sb != current_sb:
-                    current_sb, current_bb = new_sb, new_bb
-                    table.engine.set_blinds(current_sb, current_bb)
-                    await _send(self.bot, MAIN_GROUP_ID,
-                               f"⬆️ Blinds increased to {current_sb}/{current_bb}!")
-
-                n = len(active)
-                sb_pos = dealer_idx % n
-                rotated = active[sb_pos:] + active[:sb_pos]
-
-                await table.run_single_round(rotated, current_sb, current_bb)
-                dealer_idx += 1
-
-                # Sync stacks from engine back to agents
-                for p in table.engine.players:
-                    agent = table._by_player_id.get(p.id)
-                    if agent:
-                        agent.stack = p.stack
-
-                # Detect and announce eliminations
-                for a in agents:
-                    if a.stack == 0 and a in active:
-                        await _send(self.bot, MAIN_GROUP_ID, f"💀 @{a.username} is eliminated!")
-
-                # Show chip counts
-                standings = sorted(
-                    [a for a in agents if a.stack > 0],
-                    key=lambda x: x.stack, reverse=True
-                )
-                if len(standings) >= 2:
-                    lines = ["Chip counts:"]
-                    for a in standings:
-                        lines.append(f"  @{a.username}: {a.stack}")
-                    await _send(self.bot, MAIN_GROUP_ID, "\n".join(lines))
-
-                # Pause between rounds (longer in spectator mode for result display)
-                with _spectator_lock:
-                    if _spectator_state["spectator_mode"]:
-                        inter_round = _spectator_state["round_pause"]
-                    else:
-                        inter_round = 0.0
-                await asyncio.sleep(inter_round)
-
             # Tournament over
-            winner = max(agents, key=lambda a: a.stack)
+            alive = [a for a in agents if a.stack > 0]
+            winner = alive[0] if alive else max(agents, key=lambda a: a.stack)
             log.info("=== TOURNAMENT OVER. Winner: @%s ===", winner.username)
             await _send(self.bot, MAIN_GROUP_ID,
                         f"🏆 Tournament over!\n@{winner.username} wins with {winner.stack} chips!")
-            await table._ws_broadcast({
-                "type": "tournament_over",
-                "winner": winner.username,
-                "winner_id": winner.player_id,
-                "stack": winner.stack,
-            })
+            # Broadcast to all remaining WS connections
+            for ws in list(self.ws_connections.values()):
+                try:
+                    await ws.send(json.dumps({
+                        "type": "tournament_over",
+                        "winner": winner.username,
+                        "winner_id": winner.player_id,
+                        "stack": winner.stack,
+                    }))
+                except Exception:
+                    pass
             with _spectator_lock:
                 _spectator_state["game_state"] = "tournament_over"
                 _spectator_state["winner"] = winner.username
                 _spectator_state["timestamp"] = int(time.time())
-            table.engine.state = GameState.WAITING
+            for t in self.tables.values():
+                t.engine.state = GameState.WAITING
 
+        except asyncio.CancelledError:
+            log.info("Tournament coordinator cancelled")
+            raise
         except Exception as e:
             log.error("Tournament crashed: %s", e, exc_info=True)
             try:
                 await _send(self.bot, MAIN_GROUP_ID, f"❌ Tournament error: {e}")
             except Exception:
                 pass
+
+    async def _run_table_loop(self, table_id: int):
+        """Run rounds at one table until ≤1 player remains at that table OR
+        the tournament coordinator decides to break it.
+        """
+        table = self.tables.get(table_id)
+        if not table:
+            return
+        agents = table.agents  # live reference — players can be added/removed
+        dealer_idx = 0
+
+        try:
+            while True:
+                # Re-read agents each iteration — may have been mutated by breaking logic
+                active = [a for a in table.agents if a.stack > 0]
+                if len(active) < 2:
+                    log.info("[T%d] table exiting — %d active player(s)", table_id, len(active))
+                    break
+
+                # Update blinds for this round from the global clock
+                self._global_round_count += 1
+                new_sb, new_bb = get_blinds(self._global_round_count)
+                if (new_sb, new_bb) != (table.engine.small_blind, table.engine.big_blind):
+                    table.engine.set_blinds(new_sb, new_bb)
+
+                n = len(active)
+                sb_pos = dealer_idx % n
+                rotated = active[sb_pos:] + active[:sb_pos]
+
+                await table.run_single_round(rotated, new_sb, new_bb)
+                dealer_idx += 1
+
+                # Sync stacks engine → agents
+                for p in table.engine.players:
+                    agent = table._by_player_id.get(p.id)
+                    if agent:
+                        agent.stack = p.stack
+
+                # Pause between rounds
+                with _spectator_lock:
+                    pause = _spectator_state["round_pause"] if _spectator_state["spectator_mode"] else 0.0
+                if pause > 0:
+                    await asyncio.sleep(pause)
+        except asyncio.CancelledError:
+            log.info("[T%d] table task cancelled", table_id)
+            raise
+        except Exception as e:
+            log.error("[T%d] table crashed: %s", table_id, e, exc_info=True)
+
+    async def _handle_table_breaking(self):
+        """After a table finishes, move its survivors to other tables.
+        Also forms a final table when remaining players ≤ table_size.
+        """
+        agents = self._tournament_agents
+        all_alive = [a for a in agents if a.stack > 0]
+
+        # Announce eliminations for players who just went out
+        for a in agents:
+            if a.stack == 0 and getattr(a, "_announced_out", False) is False:
+                a._announced_out = True  # type: ignore[attr-defined]
+                await _send(self.bot, MAIN_GROUP_ID, f"💀 @{a.username} is eliminated!")
+                ws = self.ws_connections.get(a.username.lower())
+                if ws:
+                    try:
+                        place = len(agents) - sum(1 for x in agents if x.stack == 0) + 1
+                        await ws.send(json.dumps({
+                            "type": "eliminated",
+                            "place": len([x for x in agents if x.stack == 0]),
+                            "players_left": len(all_alive),
+                        }))
+                    except Exception:
+                        pass
+
+        # Find tables that are done (≤1 active player) — their survivors need relocating
+        to_break: list[int] = []
+        for tid, table in list(self.tables.items()):
+            alive = [a for a in table.agents if a.stack > 0]
+            # Break table if it has <=1 survivor AND is not running
+            if tid not in self._table_tasks and len(alive) <= 1:
+                to_break.append(tid)
+
+        for tid in to_break:
+            table = self.tables[tid]
+            survivors = [a for a in table.agents if a.stack > 0]
+
+            # If final table is needed (total alive ≤ table_size), consolidate later
+            if len(all_alive) <= self._table_size and len(self.tables) > 1:
+                # Hold survivors; final table will be created below
+                pass
+            elif survivors:
+                # Move each survivor to the smallest OTHER active table
+                for survivor in survivors:
+                    candidate_tids = [
+                        t for t in self.tables
+                        if t != tid and t in self._table_tasks
+                    ]
+                    if not candidate_tids:
+                        continue
+                    target_tid = min(
+                        candidate_tids,
+                        key=lambda t: len([a for a in self.tables[t].agents if a.stack > 0])
+                    )
+                    target = self.tables[target_tid]
+                    target.agents.append(survivor)
+                    target._by_player_id[survivor.player_id] = survivor
+                    await _send(self.bot, MAIN_GROUP_ID,
+                                f"🔀 @{survivor.username} moved to Table {target_tid}")
+                    log.info("Moved @%s from T%d to T%d", survivor.username, tid, target_tid)
+                    # Notify the bot of its new table
+                    ws = self.ws_connections.get(survivor.username.lower())
+                    if ws:
+                        try:
+                            await ws.send(json.dumps({
+                                "type": "table_change",
+                                "new_table": target_tid,
+                            }))
+                        except Exception:
+                            pass
+
+            # Remove the broken table
+            self.tables.pop(tid, None)
+            log.info("[T%d] table broken", tid)
+
+        # Form final table when remaining players can all fit at one table AND
+        # we don't already have them all at a single running table
+        fits_one_table = len(all_alive) <= self._table_size
+        single_running = (
+            len(self.tables) == 1 and
+            all(len(t.agents) == len(all_alive) for t in self.tables.values())
+        )
+        if len(all_alive) >= 2 and fits_one_table and not single_running:
+            # Cancel all running tables
+            for task in self._table_tasks.values():
+                if not task.done():
+                    task.cancel()
+            try:
+                await asyncio.gather(*self._table_tasks.values(), return_exceptions=True)
+            except Exception:
+                pass
+            self._table_tasks.clear()
+
+            # Clear old tables, create single final table
+            self.tables.clear()
+            final_tid = 1
+            final = TableSession(
+                table_id=final_tid, agents=all_alive, bot=self.bot,
+                ws_connections=self.ws_connections,
+            )
+            final.engine.set_blinds(*get_blinds(max(1, self._global_round_count)))
+            self.tables[final_tid] = final
+            self._legacy_single_table_id = final_tid
+
+            await _send(self.bot, MAIN_GROUP_ID,
+                        f"🎯 Final table! {len(all_alive)} players remaining")
+            for a in all_alive:
+                ws = self.ws_connections.get(a.username.lower())
+                if ws:
+                    try:
+                        await ws.send(json.dumps({
+                            "type": "table_change",
+                            "new_table": final_tid,
+                            "reason": "final_table",
+                        }))
+                    except Exception:
+                        pass
+
+            with _spectator_lock:
+                _spectator_state["table_count"] = 1
+                _spectator_state["tables"] = {
+                    "1": {"players": [a.username for a in all_alive]}
+                }
+
+            # Start the final table loop
+            task = asyncio.create_task(self._run_table_loop(final_tid))
+            self._table_tasks[final_tid] = task
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1811,7 @@ async def async_main():
     with _spectator_lock:
         _spectator_state["tg_configured"] = TG_CONFIGURED
         _spectator_state["tg_logging"]    = False  # off by default; enable from control panel
+        _spectator_state["table_size"]    = max(TABLE_SIZE_MIN, min(TABLE_SIZE_DEFAULT, TABLE_SIZE_MAX))
 
     agents = load_agents()
     if not agents:
