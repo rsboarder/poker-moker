@@ -152,6 +152,21 @@
     </div>
 
     <div class="card spectator-card">
+      <h2>Tournament Setup</h2>
+      <div class="spectator-row">
+        <span class="sp-label">Table size</span>
+        <div class="delay-row">
+          <input class="delay-input" id="input-table-size" type="number" min="2" max="10" step="1" value="6" onchange="saveSpectatorConfig()" />
+          <span class="sp-unit">players</span>
+        </div>
+      </div>
+      <div class="spectator-row">
+        <span class="sp-label">Active tables</span>
+        <span class="info-value" id="info-table-count">—</span>
+      </div>
+    </div>
+
+    <div class="card spectator-card">
       <h2>Spectator Mode</h2>
       <div class="spectator-row">
         <span class="sp-label">Slow mode</span>
@@ -318,10 +333,20 @@ function update(s) {
   // Sync input values only if not focused (avoid overwriting user edits)
   const adEl = document.getElementById('input-action-delay');
   const rpEl = document.getElementById('input-round-pause');
+  const tsEl = document.getElementById('input-table-size');
   if (document.activeElement !== adEl && s.action_delay !== undefined)
     adEl.value = s.action_delay;
   if (document.activeElement !== rpEl && s.round_pause !== undefined)
     rpEl.value = s.round_pause;
+  if (document.activeElement !== tsEl && s.table_size !== undefined)
+    tsEl.value = s.table_size;
+  // Lock table_size while game is running
+  tsEl.disabled = playing || (s.table_count || 0) > 0;
+
+  // Table count display
+  const tc = s.table_count || 0;
+  const tcEl = document.getElementById('info-table-count');
+  tcEl.textContent = tc === 0 ? '—' : (tc === 1 ? '1 table' : `${tc} tables`);
 }
 
 async function fetchState() {
@@ -369,12 +394,17 @@ async function toggleSpectator() {
 async function saveSpectatorConfig() {
   const actionDelay = parseFloat(document.getElementById('input-action-delay').value) || 0;
   const roundPause  = parseFloat(document.getElementById('input-round-pause').value)  || 0;
+  const tableSize   = parseInt(document.getElementById('input-table-size').value) || 6;
   try {
-    await fetch(`${API}/spectator-config`, {
+    const r = await fetch(`${API}/spectator-config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action_delay: actionDelay, round_pause: roundPause }),
+      body: JSON.stringify({ action_delay: actionDelay, round_pause: roundPause, table_size: tableSize }),
     });
+    const d = await r.json();
+    if (!d.ok && d.error) {
+      alert(d.error);
+    }
   } catch(e) { console.error('spectator-config error:', e); }
 }
 

@@ -257,6 +257,64 @@
   .waiting-msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:20; pointer-events:none; }
   .waiting-txt { font-family:'Cinzel',serif; font-size:18px; letter-spacing:.28em; color:rgba(201,162,39,.35); text-transform:uppercase; animation:wglow 2.4s ease-in-out infinite; }
   @keyframes wglow { 0%,100%{opacity:.3} 50%{opacity:.7} }
+
+  /* ── MULTI-TABLE TABS ────────────────────────────────── */
+  .table-tabs {
+    display: flex; gap: 8px; padding: 10px 28px 0;
+    background: transparent; flex-wrap: wrap;
+  }
+  .table-tab {
+    padding: 8px 16px; border-radius: 8px; cursor: pointer;
+    background: rgba(30, 30, 40, 0.6); border: 1px solid rgba(201,162,39,0.25);
+    color: rgba(232, 221, 180, 0.75); font-size: 13px; font-weight: 500;
+    letter-spacing: 0.04em;
+    transition: all 0.15s;
+  }
+  .table-tab:hover { background: rgba(60, 60, 70, 0.8); color: #e8ddb4; }
+  .table-tab.active { background: rgba(201,162,39,0.25); color: #fff2c0; border-color: rgba(201,162,39,0.8); }
+  .table-tab.overview { background: rgba(100,149,237,0.15); border-color: rgba(100,149,237,0.3); color: #aec6ef; }
+  .table-tab.overview.active { background: rgba(100,149,237,0.35); border-color: rgba(100,149,237,0.8); color: #d7e8ff; }
+  .table-tab .tt-meta { opacity: 0.6; font-size: 11px; margin-left: 6px; }
+
+  /* ── MULTI-TABLE OVERVIEW GRID ───────────────────────── */
+  .overview-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px; padding: 14px; width: 100%; height: 100%;
+    overflow-y: auto;
+  }
+  .overview-grid.hidden { display: none; }
+  .mini-table {
+    background: radial-gradient(ellipse at center, #1e3a2c 0%, #0c1b15 75%);
+    border: 1px solid rgba(201,162,39,0.3);
+    border-radius: 12px;
+    padding: 14px; cursor: pointer;
+    transition: transform 0.15s, border-color 0.15s;
+    min-height: 160px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .mini-table:hover { transform: translateY(-2px); border-color: rgba(201,162,39,0.7); }
+  .mini-head {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 12px; color: #c9a227; text-transform: uppercase; letter-spacing: 0.1em;
+  }
+  .mini-head .mini-tid { font-family: 'Cinzel', serif; font-size: 14px; color: #f0c040; }
+  .mini-head .mini-state { font-size: 10px; color: rgba(232, 221, 180, 0.6); }
+  .mini-board { display: flex; gap: 4px; min-height: 28px; align-items: center; flex-wrap: wrap; }
+  .mini-card {
+    padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: bold;
+    background: #f5f0e0; color: #1a1a1a; box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+  }
+  .mini-card.red { color: #c02020; }
+  .mini-pot { font-size: 12px; color: #e8ddb4; }
+  .mini-pot strong { color: #f0c040; }
+  .mini-players {
+    display: flex; flex-direction: column; gap: 3px;
+    font-size: 11px; color: rgba(232, 221, 180, 0.8);
+  }
+  .mini-player { display: flex; justify-content: space-between; padding: 2px 0; }
+  .mini-player.current { color: #f0c040; font-weight: bold; }
+  .mini-player.folded { opacity: 0.4; text-decoration: line-through; }
+  .mini-player.out { opacity: 0.3; }
+  .mini-stack { color: #82c882; }
 </style>
 </head>
 <body>
@@ -274,6 +332,8 @@
   </div>
 </header>
 
+<div class="table-tabs" id="tableTabs" style="display:none"></div>
+
 <div class="main">
   <div class="table-zone">
     <div class="arena" id="arena">
@@ -290,6 +350,7 @@
         <div class="waiting-txt" id="waitTxt">Waiting for game to start</div>
       </div>
     </div>
+    <div class="overview-grid hidden" id="overviewGrid"></div>
   </div>
 
   <div class="log-panel">
@@ -627,6 +688,16 @@ function renderShowdown(result) {
 // ── State hash ───────────────────────────────────────────
 function hashState(s) {
   if (!s) return '';
+  // For multi-table, include each table's state
+  const tablesHash = {};
+  if (s.tables) {
+    for (const tid of Object.keys(s.tables)) {
+      const t = s.tables[tid];
+      tablesHash[tid] = `${t.pot}|${t.street}|${t.round_number}|${t.current_player}|` +
+        (t.community_cards || []).join(',') + '|' +
+        (t.players || []).map(p => `${p.id}:${p.stack}:${p.street_bet}:${p.status}`).join(';');
+    }
+  }
   return JSON.stringify({
     ts:      s.timestamp,
     pot:     s.pot,
@@ -637,24 +708,144 @@ function hashState(s) {
     acts:    s.last_actions,
     btn:     s.btn_player_id,
     sd:      s.showdown_result?.timestamp,
+    tc:      s.table_count,
+    focus:   focusedTableId,
+    tables:  tablesHash,
     players: (s.players || []).map(p =>
       `${p.id}:${p.stack}:${p.street_bet}:${p.status}:${(p.hole_cards||[]).join(',')}`),
   });
 }
 
 // ── Main update ──────────────────────────────────────────
+// ── Multi-table view state ──────────────────────────────
+// null = overview (all tables visible), N = focus on table N
+let focusedTableId = null;
+
+function getFocusedTable(state) {
+  if (!state || !state.tables) return null;
+  const tables = state.tables;
+  if (focusedTableId != null && tables[String(focusedTableId)]) {
+    return tables[String(focusedTableId)];
+  }
+  return null;
+}
+
+function renderTabs(state) {
+  const tabsEl = document.getElementById('tableTabs');
+  const tableCount = state?.table_count || 0;
+  if (tableCount <= 1) {
+    tabsEl.style.display = 'none';
+    return;
+  }
+  tabsEl.style.display = 'flex';
+  const tables = state?.tables || {};
+  const tids = Object.keys(tables).map(k => parseInt(k)).sort((a, b) => a - b);
+
+  let html = `<div class="table-tab overview ${focusedTableId == null ? 'active' : ''}" data-tid="overview">Overview <span class="tt-meta">${tableCount}</span></div>`;
+  for (const tid of tids) {
+    const t = tables[String(tid)];
+    const active = (focusedTableId === tid) ? 'active' : '';
+    const alive = (t.players || []).filter(p => p.status !== 'folded' && p.stack > 0).length;
+    html += `<div class="table-tab ${active}" data-tid="${tid}">Table ${tid} <span class="tt-meta">${alive}p · ${t.pot || 0}</span></div>`;
+  }
+  tabsEl.innerHTML = html;
+
+  tabsEl.querySelectorAll('.table-tab').forEach(el => {
+    el.onclick = () => {
+      const v = el.dataset.tid;
+      focusedTableId = (v === 'overview') ? null : parseInt(v);
+      prevHash = null; // force re-render
+      poll();
+    };
+  });
+}
+
+function renderOverview(state) {
+  const grid = document.getElementById('overviewGrid');
+  const arena = document.getElementById('arena');
+  const tables = state?.tables || {};
+  const tids = Object.keys(tables).map(k => parseInt(k)).sort((a, b) => a - b);
+  const multiTable = (state?.table_count || 0) > 1;
+
+  if (multiTable && focusedTableId == null) {
+    // Overview mode: show grid, hide single-arena
+    arena.style.display = 'none';
+    grid.classList.remove('hidden');
+    grid.innerHTML = tids.map(tid => miniTableHtml(tables[String(tid)], tid)).join('');
+    grid.querySelectorAll('.mini-table').forEach(el => {
+      el.onclick = () => {
+        focusedTableId = parseInt(el.dataset.tid);
+        prevHash = null;
+        poll();
+      };
+    });
+  } else {
+    grid.classList.add('hidden');
+    arena.style.display = '';
+  }
+}
+
+function miniTableHtml(t, tid) {
+  if (!t) return '';
+  const community = (t.community_cards || []).map(c => {
+    const red = c.endsWith('h') || c.endsWith('d');
+    return `<span class="mini-card ${red ? 'red' : ''}">${c}</span>`;
+  }).join('');
+  const playersHtml = (t.players || []).map(p => {
+    const cls = p.status === 'folded' ? 'folded'
+              : (p.stack === 0 ? 'out' : '')
+              + (p.id === t.current_player ? ' current' : '');
+    return `<div class="mini-player ${cls}"><span>@${p.username}</span><span class="mini-stack">${p.stack}</span></div>`;
+  }).join('');
+  return `
+    <div class="mini-table" data-tid="${tid}">
+      <div class="mini-head">
+        <span class="mini-tid">Table ${tid}</span>
+        <span class="mini-state">${(t.street || t.game_state || '').toUpperCase()}</span>
+      </div>
+      <div class="mini-board">${community || '<span style="color:#555;font-size:10px">preflop</span>'}</div>
+      <div class="mini-pot">Pot: <strong>${t.pot || 0}</strong></div>
+      <div class="mini-players">${playersHtml}</div>
+    </div>
+  `;
+}
+
 function update(state) {
   const hash = hashState(state);
   if (hash === prevHash) return;
   prevHash = hash;
 
+  const tableCount = state?.table_count || 0;
   const waiting  = !state || state.game_state === 'waiting';
   const tourOver = state?.game_state === 'tournament_over';
 
-  document.getElementById('hRound').textContent  = state?.round_number || '—';
-  document.getElementById('hStreet').textContent = (state?.street || 'waiting').toUpperCase();
-  document.getElementById('hBlinds').textContent = state?.blinds
-    ? `${state.blinds.sb}/${state.blinds.bb}` : '—/—';
+  renderTabs(state);
+
+  // Multi-table overview mode
+  if (tableCount > 1 && focusedTableId == null && !waiting && !tourOver) {
+    renderOverview(state);
+    // Update header with aggregate info
+    document.getElementById('hRound').textContent  = state?.round_number || '—';
+    document.getElementById('hStreet').textContent = `${tableCount} TABLES`;
+    document.getElementById('hBlinds').textContent = state?.blinds
+      ? `${state.blinds.sb}/${state.blinds.bb}` : '—/—';
+    renderLog(state?.recent_events || [], state?.players);
+    return;
+  }
+
+  // Single-table view (either 1 table OR user focused on a specific one)
+  renderOverview(state); // hides grid
+
+  // If focused on a specific table, use its state instead of flat state
+  const viewState = getFocusedTable(state) || state;
+
+  document.getElementById('hRound').textContent  = viewState?.round_number || '—';
+  const streetLabel = (viewState?.street || 'waiting').toUpperCase();
+  document.getElementById('hStreet').textContent = focusedTableId != null
+    ? `T${focusedTableId} · ${streetLabel}`
+    : streetLabel;
+  document.getElementById('hBlinds').textContent = viewState?.blinds
+    ? `${viewState.blinds.sb}/${viewState.blinds.bb}` : '—/—';
 
   const waitTxt = document.getElementById('waitTxt');
   if (tourOver) {
@@ -666,17 +857,18 @@ function update(state) {
   }
   document.getElementById('waitMsg').style.display = (waiting || tourOver) ? 'flex' : 'none';
 
-  renderCommunity(state?.community_cards || []);
-  renderPot(state?.pot || 0);
+  renderCommunity(viewState?.community_cards || []);
+  renderPot(viewState?.pot || 0);
   renderPlayers(
-    state?.players || [],
-    state?.current_player ?? null,
+    viewState?.players || [],
+    viewState?.current_player ?? null,
+    // sb/bb/btn come from flat state (table-level snapshot doesn't include them yet)
     state?.sb_player_id   ?? null,
     state?.bb_player_id   ?? null,
     state?.btn_player_id  ?? null,
     state?.last_actions   || {}
   );
-  renderLog(state?.recent_events || [], state?.players);
+  renderLog(state?.recent_events || [], viewState?.players);
   renderShowdown(state?.showdown_result || null);
 }
 
@@ -699,6 +891,15 @@ async function poll() {
     }
   }
 }
+
+// Support ?table=N in URL for deep linking
+(function() {
+  const params = new URLSearchParams(window.location.search);
+  const t = params.get('table');
+  if (t && !isNaN(parseInt(t))) {
+    focusedTableId = parseInt(t);
+  }
+})();
 
 poll();
 setInterval(poll, TICK);
