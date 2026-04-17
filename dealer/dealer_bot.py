@@ -270,6 +270,7 @@ class TableSession:
         self._action_event = asyncio.Event()
         self._received_action: tuple[str, int] | None = None
         self._turn_id: int = 0
+        self._tg_buffer: list[str] = []  # accumulates per-round lines for one batched TG message
 
     def accept_action(self, sender_username: str, action: str, amount: int) -> bool:
         """Try to accept an action from a Telegram message. Returns True if accepted."""
@@ -371,6 +372,15 @@ class TableSession:
         log.info("[T%d] Round %d complete. Final state: %s",
                  self.table_id, self.engine.round_number, self.engine.state.value)
 
+        # Send one batched round summary to Telegram
+        if self._tg_buffer:
+            stacks_line = "Stacks: " + " | ".join(
+                f"@{a.username}: {a.stack}" for a in self.agents
+            )
+            self._tg_buffer.append(stacks_line)
+            await _send(self.bot, MAIN_GROUP_ID, "\n".join(self._tg_buffer))
+            self._tg_buffer.clear()
+
         # Send round_end to all WS bots
         players_final = []
         for p in self.engine.players:
@@ -395,8 +405,8 @@ class TableSession:
                 target = ev.data.get("target")
                 text = ev.data.get("text", "")
                 if target == "all":
-                    await _send(self.bot, MAIN_GROUP_ID, text)
-                    # Parse [DEALER] text into structured event for WS bots
+                    # Buffer for batched round summary; still broadcast via WS immediately
+                    self._tg_buffer.append(text)
                     ws_event = self._parse_dealer_text_to_event(text)
                     await self._ws_broadcast(ws_event)
                     self._update_spectator(text)
@@ -407,7 +417,8 @@ class TableSession:
                         self._update_spectator()
 
             elif ev.type == "showdown":
-                await self._send_showdown(ev)
+                showdown_text = self._format_showdown(ev)
+                self._tg_buffer.append(showdown_text)
                 winner_id = ev.data.get("winner_id")
                 winner_agent = self._by_player_id.get(winner_id)
                 await self._ws_broadcast({
@@ -635,19 +646,17 @@ class TableSession:
                 _spectator_state["recent_events"].append(event_text)
                 _spectator_state["recent_events"] = _spectator_state["recent_events"][-30:]
 
-    async def _send_showdown(self, ev: GameEvent):
-        reason     = ev.data.get("reason", "showdown")
-        hands      = ev.data.get("hands", [])
+    def _format_showdown(self, ev: GameEvent) -> str:
+        reason      = ev.data.get("reason", "showdown")
+        hands       = ev.data.get("hands", [])
         pot_results = ev.data.get("pots", [])
-        total_won  = ev.data.get("total_won", {})
-        pot        = ev.data["pot"]
+        pot         = ev.data["pot"]
 
         def _name(pid: int) -> str:
             a = self._by_player_id.get(pid)
             return f"@{a.username}" if a else f"Player {pid}"
 
         lines = []
-
         if reason == "fold":
             winner_id = ev.data["winner_id"]
             lines.append(f"🏆 {_name(winner_id)} wins {pot} chips! (opponent folded)")
@@ -666,15 +675,17 @@ class TableSession:
                     lines.append(f"🏆 {label} ({pr['amount']}): {_name(wid)} wins")
 
         if reason not in ("fold", "last_standing") and hands:
-            lines.append("\nShowdown:")
+            lines.append("Showdown:")
             for h in hands:
                 name = _name(h["player_id"])
                 cards = " ".join(h.get("hole_cards", []))
                 rank = h.get("rank", "—")
                 lines.append(f"  {name}: {cards} — {rank}")
 
-        result_text = "\n".join(lines)
-        await _send(self.bot, MAIN_GROUP_ID, result_text)
+        return "\n".join(lines)
+
+    async def _send_showdown(self, ev: GameEvent):
+        result_text = self._format_showdown(ev)
         with _spectator_lock:
             _spectator_state["showdown_result"] = {
                 "text": result_text,
