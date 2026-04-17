@@ -354,10 +354,12 @@ class TableSession:
     """Encapsulates state for a single poker table. DealerBot owns one or more."""
 
     def __init__(self, table_id: int, agents: list[AgentInfo], bot: Bot,
-                 ws_connections: dict[str, websockets.WebSocketServerProtocol] | None = None):
+                 ws_connections: dict[str, websockets.WebSocketServerProtocol] | None = None,
+                 dealer: "DealerBot | None" = None):
         self.table_id = table_id
         self.engine = GameEngine()
         self.agents = agents
+        self._dealer = dealer  # back-reference for broadcast helpers (None in tests using MiniDealer)
         self.bot = bot
         self._ws = ws_connections or {}
         self._by_player_id: dict[int, AgentInfo] = {a.player_id: a for a in agents}
@@ -587,14 +589,22 @@ class TableSession:
         return event
 
     async def _ws_broadcast(self, msg: dict):
-        """Send a message to all WS-connected bots at this table."""
+        """Send a message to all WS-connected bots at this table.
+        Delegates to DealerBot._broadcast_to_players when a dealer ref is available;
+        falls back to the legacy per-table inline loop (used by MiniDealer-based tests).
+        """
+        usernames = [a.username for a in self.agents]
+        if self._dealer is not None:
+            await self._dealer._broadcast_to_players(usernames, msg)
+            return
+        # Legacy fallback: no dealer back-ref (e.g. test MiniDealer)
         raw = json.dumps(msg)
-        for agent in self.agents:
-            ws = self._ws.get(agent.username.lower())
+        for u in usernames:
+            ws = self._ws.get(u.lower())
             if ws:
                 try:
                     await ws.send(raw)
-                except websockets.ConnectionClosed:
+                except Exception:
                     pass
 
     async def _send_hole_cards(self, ev: GameEvent):
@@ -918,6 +928,40 @@ class DealerBot:
         return False
 
     # ------------------------------------------------------------------
+    # WS broadcast helpers
+    # ------------------------------------------------------------------
+
+    async def _broadcast_global(self, msg: dict) -> None:
+        """Send a message to every connected WS client."""
+        raw = json.dumps(msg)
+        for ws in list(self.ws_connections.values()):
+            try:
+                await ws.send(raw)
+            except Exception:
+                pass
+
+    async def _broadcast_to_players(self, usernames, msg: dict) -> None:
+        """Send a message to every WS in `usernames` (case-insensitive match)."""
+        raw = json.dumps(msg)
+        for u in usernames:
+            ws = self.ws_connections.get(u.lower())
+            if ws:
+                try:
+                    await ws.send(raw)
+                except Exception:
+                    pass
+
+    async def _send_to_player(self, username: str, msg: dict) -> None:
+        """Send a message to a single WS by username (no-op if not connected)."""
+        ws = self.ws_connections.get(username.lower())
+        if not ws:
+            return
+        try:
+            await ws.send(json.dumps(msg))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # WebSocket handler
     # ------------------------------------------------------------------
 
@@ -1164,6 +1208,7 @@ class DealerBot:
             self.tables[tid] = TableSession(
                 table_id=tid, agents=seated, bot=self.bot,
                 ws_connections=self.ws_connections,
+                dealer=self,
             )
             log.info("[T%d] seated: %s", tid, [a.username for a in seated])
 
@@ -1180,17 +1225,12 @@ class DealerBot:
         """Send tournament_start message to each WS bot with their table assignment."""
         for tid, table in self.tables.items():
             for agent in table.agents:
-                ws = self.ws_connections.get(agent.username.lower())
-                if ws:
-                    try:
-                        await ws.send(json.dumps({
-                            "type": "tournament_start",
-                            "players": len(self._tournament_agents),
-                            "tables": len(self.tables),
-                            "your_table": tid,
-                        }))
-                    except Exception:
-                        pass
+                await self._send_to_player(agent.username, {
+                    "type": "tournament_start",
+                    "players": len(self._tournament_agents),
+                    "tables": len(self.tables),
+                    "your_table": tid,
+                })
 
     # ------------------------------------------------------------------
     # HTTP control API (called from spectator server thread via run_coroutine_threadsafe)
@@ -1505,17 +1545,12 @@ class DealerBot:
             log.info("=== TOURNAMENT OVER. Winner: @%s ===", winner.username)
             await _send(self.bot, MAIN_GROUP_ID,
                         f"🏆 Tournament over!\n@{winner.username} wins with {winner.stack} chips!")
-            # Broadcast to all remaining WS connections
-            for ws in list(self.ws_connections.values()):
-                try:
-                    await ws.send(json.dumps({
-                        "type": "tournament_over",
-                        "winner": winner.username,
-                        "winner_id": winner.player_id,
-                        "stack": winner.stack,
-                    }))
-                except Exception:
-                    pass
+            await self._broadcast_global({
+                "type": "tournament_over",
+                "winner": winner.username,
+                "winner_id": winner.player_id,
+                "stack": winner.stack,
+            })
             with _spectator_lock:
                 _spectator_state["game_state"] = "tournament_over"
                 _spectator_state["winner"] = winner.username
@@ -1593,16 +1628,11 @@ class DealerBot:
             if a.stack == 0 and a.player_id not in self._eliminated_announced:
                 self._eliminated_announced.add(a.player_id)
                 await _send(self.bot, MAIN_GROUP_ID, f"💀 @{a.username} is eliminated!")
-                ws = self.ws_connections.get(a.username.lower())
-                if ws:
-                    try:
-                        await ws.send(json.dumps({
-                            "type": "eliminated",
-                            "place": len([x for x in agents if x.stack == 0]),
-                            "players_left": len(all_alive),
-                        }))
-                    except Exception:
-                        pass
+                await self._send_to_player(a.username, {
+                    "type": "eliminated",
+                    "place": len([x for x in agents if x.stack == 0]),
+                    "players_left": len(all_alive),
+                })
 
         # Find tables that are done (≤1 active player) — their survivors need relocating
         to_break: list[int] = []
@@ -1639,16 +1669,10 @@ class DealerBot:
                     await _send(self.bot, MAIN_GROUP_ID,
                                 f"🔀 @{survivor.username} moved to Table {target_tid}")
                     log.info("Moved @%s from T%d to T%d", survivor.username, tid, target_tid)
-                    # Notify the bot of its new table
-                    ws = self.ws_connections.get(survivor.username.lower())
-                    if ws:
-                        try:
-                            await ws.send(json.dumps({
-                                "type": "table_change",
-                                "new_table": target_tid,
-                            }))
-                        except Exception:
-                            pass
+                    await self._send_to_player(survivor.username, {
+                        "type": "table_change",
+                        "new_table": target_tid,
+                    })
 
             # Remove the broken table
             self.tables.pop(tid, None)
@@ -1678,23 +1702,21 @@ class DealerBot:
             final = TableSession(
                 table_id=final_tid, agents=all_alive, bot=self.bot,
                 ws_connections=self.ws_connections,
+                dealer=self,
             )
             final.engine.set_blinds(*get_blinds(max(1, self._global_round_count)))
             self.tables[final_tid] = final
 
             await _send(self.bot, MAIN_GROUP_ID,
                         f"🎯 Final table! {len(all_alive)} players remaining")
-            for a in all_alive:
-                ws = self.ws_connections.get(a.username.lower())
-                if ws:
-                    try:
-                        await ws.send(json.dumps({
-                            "type": "table_change",
-                            "new_table": final_tid,
-                            "reason": "final_table",
-                        }))
-                    except Exception:
-                        pass
+            await self._broadcast_to_players(
+                [a.username for a in all_alive],
+                {
+                    "type": "table_change",
+                    "new_table": final_tid,
+                    "reason": "final_table",
+                },
+            )
 
             with _spectator_lock:
                 _spectator_state["table_count"] = 1
