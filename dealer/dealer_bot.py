@@ -71,6 +71,9 @@ _spectator_state: dict = {
     "ws_players": [],
     "tg_configured": False,  # set after config load
     "tg_logging": False,     # toggled from control panel
+    "spectator_mode": False, # slow down game for human viewers
+    "action_delay": 2.0,     # seconds to wait after each player action
+    "round_pause": 10.0,     # seconds to pause between rounds
 }
 _spectator_lock = threading.Lock()
 
@@ -129,6 +132,27 @@ class _SpectatorHandler(BaseHTTPRequestHandler):
                 new_val = _spectator_state["tg_logging"]
             log.info("Telegram logging %s via HTTP", "enabled" if new_val else "disabled")
             self._send_json(200, {"ok": True, "tg_logging": new_val})
+        elif self.path == "/spectator-toggle":
+            with _spectator_lock:
+                _spectator_state["spectator_mode"] = not _spectator_state["spectator_mode"]
+                new_val = _spectator_state["spectator_mode"]
+            log.info("Spectator mode %s via HTTP", "enabled" if new_val else "disabled")
+            self._send_json(200, {"ok": True, "spectator_mode": new_val})
+        elif self.path == "/spectator-config":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            with _spectator_lock:
+                if "action_delay" in body:
+                    _spectator_state["action_delay"] = max(0.0, float(body["action_delay"]))
+                if "round_pause" in body:
+                    _spectator_state["round_pause"] = max(0.0, float(body["round_pause"]))
+                result = {
+                    "ok": True,
+                    "action_delay": _spectator_state["action_delay"],
+                    "round_pause": _spectator_state["round_pause"],
+                }
+            log.info("Spectator config updated: %s", result)
+            self._send_json(200, result)
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -425,6 +449,12 @@ class TableSession:
                 continue
 
             await self._dispatch_events(events)
+
+            # Spectator mode: pause after each action so humans can follow
+            with _spectator_lock:
+                delay = _spectator_state["action_delay"] if _spectator_state["spectator_mode"] else 0.0
+            if delay > 0:
+                await asyncio.sleep(delay)
 
         log.info("[T%d] Round %d complete. Final state: %s",
                  self.table_id, self.engine.round_number, self.engine.state.value)
@@ -1328,7 +1358,13 @@ class DealerBot:
                         lines.append(f"  @{a.username}: {a.stack}")
                     await _send(self.bot, MAIN_GROUP_ID, "\n".join(lines))
 
-                await asyncio.sleep(3.0)
+            # Pause between rounds (longer in spectator mode for result display)
+            with _spectator_lock:
+                if _spectator_state["spectator_mode"]:
+                    inter_round = _spectator_state["round_pause"]
+                else:
+                    inter_round = 3.0
+            await asyncio.sleep(inter_round)
 
             # Tournament over
             winner = max(agents, key=lambda a: a.stack)

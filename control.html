@@ -84,6 +84,17 @@
   #btn-tg { flex: none; padding: 6px 14px; font-size: 12px; background: #21262d; color: #8b949e; border: 1px solid #30363d; }
   #btn-tg.active { background: #0d2f0d; color: #3fb950; border-color: #3fb950; }
 
+  .spectator-card { margin-top: 16px; }
+  .spectator-row { display: flex; align-items: center; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid #21262d; }
+  .spectator-row:last-child { border-bottom: none; }
+  .sp-label { color: #8b949e; font-size: 12px; }
+  #btn-spectator { flex: none; padding: 6px 14px; font-size: 12px; font-weight: bold; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; cursor: pointer; }
+  #btn-spectator.active { background: #1a1a3a; color: #79c0ff; border-color: #388bfd; }
+  .delay-input { width: 64px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e6edf3; font-family: inherit; font-size: 12px; padding: 4px 8px; text-align: right; }
+  .delay-input:focus { outline: none; border-color: #58a6ff; }
+  .sp-unit { color: #484f58; font-size: 11px; margin-left: 4px; }
+  .delay-row { display: flex; align-items: center; gap: 6px; }
+
   .events {
     height: 220px; overflow-y: auto;
     font-size: 12px; line-height: 1.6;
@@ -138,6 +149,28 @@
     <div class="card">
       <h2>Stacks</h2>
       <div id="stacks-list"></div>
+    </div>
+
+    <div class="card spectator-card">
+      <h2>Spectator Mode</h2>
+      <div class="spectator-row">
+        <span class="sp-label">Slow mode</span>
+        <button id="btn-spectator" onclick="toggleSpectator()">OFF</button>
+      </div>
+      <div class="spectator-row">
+        <span class="sp-label">Action delay</span>
+        <div class="delay-row">
+          <input class="delay-input" id="input-action-delay" type="number" min="0" max="30" step="0.5" value="2" onchange="saveSpectatorConfig()" />
+          <span class="sp-unit">sec</span>
+        </div>
+      </div>
+      <div class="spectator-row">
+        <span class="sp-label">Round pause</span>
+        <div class="delay-row">
+          <input class="delay-input" id="input-round-pause" type="number" min="0" max="60" step="1" value="10" onchange="saveSpectatorConfig()" />
+          <span class="sp-unit">sec</span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -275,6 +308,20 @@ function update(s) {
   } else {
     tgRow.style.display = 'none';
   }
+
+  // Spectator mode
+  const btnSp = document.getElementById('btn-spectator');
+  const spOn = s.spectator_mode;
+  btnSp.textContent = spOn ? 'ON' : 'OFF';
+  btnSp.className = spOn ? 'active' : '';
+
+  // Sync input values only if not focused (avoid overwriting user edits)
+  const adEl = document.getElementById('input-action-delay');
+  const rpEl = document.getElementById('input-round-pause');
+  if (document.activeElement !== adEl && s.action_delay !== undefined)
+    adEl.value = s.action_delay;
+  if (document.activeElement !== rpEl && s.round_pause !== undefined)
+    rpEl.value = s.round_pause;
 }
 
 async function fetchState() {
@@ -309,6 +356,26 @@ async function toggleTg() {
     const d = await r.json();
     if (!d.ok) alert('TG toggle failed: ' + (d.error || '?'));
   } catch(e) { alert('Error: ' + e); }
+}
+
+async function toggleSpectator() {
+  try {
+    const r = await fetch(`${API}/spectator-toggle`, { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) alert('Toggle failed: ' + (d.error || '?'));
+  } catch(e) { alert('Error: ' + e); }
+}
+
+async function saveSpectatorConfig() {
+  const actionDelay = parseFloat(document.getElementById('input-action-delay').value) || 0;
+  const roundPause  = parseFloat(document.getElementById('input-round-pause').value)  || 0;
+  try {
+    await fetch(`${API}/spectator-config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action_delay: actionDelay, round_pause: roundPause }),
+    });
+  } catch(e) { console.error('spectator-config error:', e); }
 }
 
 fetchState();
