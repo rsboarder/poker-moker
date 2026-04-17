@@ -952,7 +952,21 @@ class DealerBot:
         self._eliminated_announced: set[int] = set()
 
         # Explicit tournament lifecycle state (see TournamentState enum).
-        self._tournament_state: TournamentState = TournamentState.IDLE
+        # Use the self.tournament_state property to set — it records history.
+        self._tournament_state_value: TournamentState = TournamentState.IDLE
+        self._state_history: list[TournamentState] = [TournamentState.IDLE]
+
+    @property
+    def _tournament_state(self) -> TournamentState:
+        return self._tournament_state_value
+
+    @_tournament_state.setter
+    def _tournament_state(self, value: TournamentState) -> None:
+        if value != self._tournament_state_value:
+            self._state_history.append(value)
+            log.info("Tournament state: %s → %s",
+                     self._tournament_state_value.value, value.value)
+        self._tournament_state_value = value
 
     def _find_table_for_user(self, username: str) -> "TableSession | None":
         """Return the TableSession where this username is a player."""
@@ -1220,6 +1234,7 @@ class DealerBot:
         self.tables.clear()
         self._global_round_count = 0
         self._eliminated_announced.clear()
+        self._state_history = [TournamentState.IDLE]
         self._tournament_state = TournamentState.IDLE
         with _spectator_lock:
             _spectator_state["game_state"] = "waiting"
@@ -1280,6 +1295,7 @@ class DealerBot:
         self._table_tasks.clear()
         self._global_round_count = 0
         self._eliminated_announced.clear()
+        self._state_history = [self._tournament_state_value]
         for tid, seated in seats_per_table.items():
             self.tables[tid] = TableSession(
                 table_id=tid, agents=seated, bot=self.bot,

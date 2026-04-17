@@ -312,9 +312,16 @@ async def run():
         assert observed["single_table_flat_matches"] in (True, None), \
             "Flat state sb_player_id did not match per-table snapshot in single-table mode"
 
-        # State machine traversed FINAL_TABLE (Item 6)
-        assert observed["seen_final_table_state"], \
-            "Never observed TournamentState.FINAL_TABLE — state machine did not traverse correctly"
+        # State machine traversed FINAL_TABLE at some point (check transition history,
+        # not live poll — the FINAL_TABLE window can be very short).
+        history = [s.value for s in dealer._state_history]
+        print(f"  state history: {history}")
+        assert db.TournamentState.FINAL_TABLE in dealer._state_history, \
+            f"Never transitioned to FINAL_TABLE. History: {history}"
+        assert db.TournamentState.RUNNING in dealer._state_history, \
+            f"Never transitioned to RUNNING. History: {history}"
+        assert db.TournamentState.COMPLETE in dealer._state_history, \
+            f"Never transitioned to COMPLETE. History: {history}"
 
         # Final table played at least one round (Item 8 plan wording: "first round on
         # original tables, then final table with a second round" — round-2 of the
