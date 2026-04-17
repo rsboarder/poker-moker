@@ -684,6 +684,7 @@ class TableSession:
             for p in self.engine.players:
                 a = self._by_player_id.get(p.id)
                 players_info.append({
+                    "id": p.id,
                     "username": a.username if a else f"player_{p.id}",
                     "stack": p.stack,
                     "street_bet": p.street_bet,
