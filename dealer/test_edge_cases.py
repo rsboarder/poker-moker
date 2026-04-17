@@ -426,6 +426,91 @@ async def test_table_crash_aborts_tournament():
         await _teardown(dealer, server, reg_path)
 
 
+async def test_proactive_consolidation():
+    """Critical: with TABLE_SIZE=6 and 8 bots spread across 2 tables (4+4),
+    after 4 eliminate to reach 4 total players (fits on one table), the
+    coordinator must form the final table WITHOUT waiting for a table to
+    fall to ≤1 player.
+    """
+    print("test_proactive_consolidation... ", end="", flush=True)
+    # Override TABLE_SIZE for this test only
+    old_table_size = os.environ.get("TABLE_SIZE")
+    os.environ["TABLE_SIZE"] = "6"
+    with db._spectator_lock:
+        old_size_state = db._spectator_state.get("table_size")
+        db._spectator_state["table_size"] = 6
+
+    dealer, server, reg_path = await _setup_dealer()
+    # _setup_dealer forces table_size=3; override to 6 for this test
+    with db._spectator_lock:
+        db._spectator_state["table_size"] = 6
+    try:
+        # 8 bots → ceil(8/6) = 2 tables
+        socks = []
+        for i in range(8):
+            ws = await websockets.connect(WS_URL)
+            await ws.send(json.dumps({"type": "register", "team": f"p{i}", "invite": INVITE}))
+            assert json.loads(await ws.recv())["type"] == "registered"
+            socks.append(ws)
+
+        # Start all socks as aggressive-shove bots so busts happen fast
+        stop = asyncio.Event()
+        bot_tasks = []
+        # We need bots that actually respond; reuse DummyBot via test_helpers
+        from test_helpers import DummyBot
+        # Close our throwaway sockets and re-create as strategy bots
+        for s in socks:
+            await s.close()
+        bots = [DummyBot(WS_URL, f"p{i}", INVITE, strategy="smart_fallback")
+                for i in range(8)]
+        bot_tasks = [asyncio.create_task(b.run(stop)) for b in bots]
+        await asyncio.sleep(0.5)
+
+        # Ensure table_size is 6 at dealer-read time (setup modifies state but
+        # other tests may have left 3 behind between runs).
+        with db._spectator_lock:
+            db._spectator_state["table_size"] = 6
+        result = await dealer.trigger_startgame()
+        assert result["ok"], result
+        assert result["tables"] == 2, f"expected 2 tables for 8 bots @ size=6, got {result['tables']}"
+
+        # Wait for tournament to complete
+        for _ in range(200):
+            await asyncio.sleep(0.1)
+            if not dealer._is_game_active():
+                break
+
+        stop.set()
+        for t in bot_tasks:
+            t.cancel()
+        try:
+            await asyncio.gather(*bot_tasks, return_exceptions=True)
+        except Exception:
+            pass
+
+        # Tournament must have traversed FINAL_TABLE (i.e., proactive consolidation fired)
+        assert db.TournamentState.FINAL_TABLE in dealer._state_history, (
+            f"FINAL_TABLE not observed at TABLE_SIZE=6 with 8 bots — proactive "
+            f"consolidation did NOT fire. History: {[s.value for s in dealer._state_history]}"
+        )
+        # And tournament must have actually completed (not hung)
+        assert db.TournamentState.COMPLETE in dealer._state_history, \
+            "Tournament did not complete"
+        alive = [a for a in dealer._tournament_agents if a.stack > 0]
+        assert len(alive) == 1, f"Expected 1 winner, got {len(alive)}"
+        print("PASS")
+    finally:
+        # Restore TABLE_SIZE
+        if old_table_size is None:
+            os.environ.pop("TABLE_SIZE", None)
+        else:
+            os.environ["TABLE_SIZE"] = old_table_size
+        with db._spectator_lock:
+            if old_size_state is not None:
+                db._spectator_state["table_size"] = old_size_state
+        await _teardown(dealer, server, reg_path)
+
+
 async def test_blind_clock_monotonic():
     """_global_round_count must be monotonic even when the fastest table breaks."""
     print("test_blind_clock_monotonic... ", end="", flush=True)
@@ -481,6 +566,7 @@ async def main():
     await test_stale_socket_rejected()
     await test_missing_turn_id_rejected()
     await test_table_crash_aborts_tournament()
+    await test_proactive_consolidation()
     await test_blind_clock_monotonic()
     print("=" * 60)
     print("ALL EDGE CASES PASS")

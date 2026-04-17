@@ -539,6 +539,12 @@ class TableSession:
             "players": players_final,
         })
 
+        # Signal the coordinator: a hand just finished. It will re-evaluate
+        # whether consolidation (final-table formation) is now appropriate,
+        # even if this table didn't break.
+        if self._dealer is not None:
+            self._dealer._coordinator_tick.set()
+
     async def _dispatch_events(self, events: list[GameEvent]):
         """Route GameEvents to appropriate Telegram chats and WS connections."""
         for ev in events:
@@ -983,6 +989,11 @@ class DealerBot:
         self._tournament_state_value: TournamentState = TournamentState.IDLE
         self._state_history: list[TournamentState] = [TournamentState.IDLE]
 
+        # Set by tables after each hand completes. Coordinator waits on this in
+        # addition to table-task completion, so it can proactively consolidate
+        # to a final table when the field fits without waiting for a table to die.
+        self._coordinator_tick = asyncio.Event()
+
     @property
     def _tournament_state(self) -> TournamentState:
         return self._tournament_state_value
@@ -1347,6 +1358,7 @@ class DealerBot:
         self._eliminated_announced.clear()
         self._state_history = [TournamentState.IDLE]
         self._tournament_state = TournamentState.IDLE
+        self._coordinator_tick.clear()
         with _spectator_lock:
             _spectator_state["game_state"] = "waiting"
             _spectator_state["street"] = "waiting"
@@ -1706,17 +1718,28 @@ class DealerBot:
                 task = asyncio.create_task(self._run_table_loop(tid))
                 self._table_tasks[tid] = task
 
-            # Main coordinator loop — waits for tables to finish, handles breaking/final
+            # Main coordinator loop. Wakes on either (a) a table task finishing
+            # OR (b) any table signaling end-of-hand via _coordinator_tick.
+            # (b) is critical so consolidation fires when the field fits one
+            # table, not only when someone drops to <=1 at a specific table.
             while self._table_tasks:
-                done, _pending = await asyncio.wait(
-                    list(self._table_tasks.values()),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                tick_task = asyncio.create_task(self._coordinator_tick.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        [*self._table_tasks.values(), tick_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not tick_task.done():
+                        tick_task.cancel()
+                # Reset the tick so subsequent hand-completions wake us again.
+                self._coordinator_tick.clear()
+
                 # Detect crashed tables FIRST — integrity critical. A crashed
                 # table task must not be treated as a clean exit, or the
                 # coordinator could crown a false winner.
                 for task in done:
-                    if task.cancelled():
+                    if task is tick_task or task.cancelled():
                         continue
                     exc = task.exception()
                     if exc is not None:
@@ -1724,15 +1747,17 @@ class DealerBot:
                                   type(exc).__name__)
                         raise exc
 
-                # Remove completed tasks from dict
+                # Remove completed table tasks from dict (tick_task was temporary)
                 for task in done:
+                    if task is tick_task:
+                        continue
                     finished_tid = next(
                         (tid for tid, t in self._table_tasks.items() if t is task), None
                     )
                     if finished_tid is not None:
                         self._table_tasks.pop(finished_tid, None)
 
-                # After a table finishes, re-balance (break tables, form final table)
+                # Re-evaluate: break dead tables, form final table if field fits.
                 await self._handle_table_breaking()
 
                 # If we've consolidated to one table that's still running, continue
