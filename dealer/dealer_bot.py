@@ -886,10 +886,6 @@ class DealerBot:
         # Active table size for current tournament (frozen at start)
         self._table_size: int = TABLE_SIZE_DEFAULT
 
-        # Legacy alias for single-table access (first table or None)
-        # Kept for backward compat with HTTP /state, /status, etc.
-        self._legacy_single_table_id: int | None = None
-
         # Will be set after Application is built
         self.bot: Bot | None = None
 
@@ -897,14 +893,6 @@ class DealerBot:
         self.ws_connections: dict[str, websockets.WebSocketServerProtocol] = {}
         # Per-bot auth tokens: username → token (issued at registration)
         self._ws_tokens: dict[str, str] = {}
-
-    @property
-    def table(self) -> "TableSession | None":
-        """Legacy: returns the "focused" table (first one) or None.
-        Used by handlers that need to find which table an action belongs to."""
-        if not self.tables:
-            return None
-        return next(iter(self.tables.values()))
 
     def _find_table_for_user(self, username: str) -> "TableSession | None":
         """Return the TableSession where this username is a player."""
@@ -1027,7 +1015,7 @@ class DealerBot:
         if not username:
             await ws.send(json.dumps({"type": "error", "text": "not registered"}))
             return
-        if not self.table:
+        if not self.tables:
             await ws.send(json.dumps({"type": "error", "text": "no active game"}))
             return
 
@@ -1173,8 +1161,6 @@ class DealerBot:
                 ws_connections=self.ws_connections,
             )
             log.info("[T%d] seated: %s", tid, [a.username for a in seated])
-
-        self._legacy_single_table_id = 1 if self.tables else None
 
         with _spectator_lock:
             _spectator_state["table_count"] = len(self.tables)
@@ -1690,7 +1676,6 @@ class DealerBot:
             )
             final.engine.set_blinds(*get_blinds(max(1, self._global_round_count)))
             self.tables[final_tid] = final
-            self._legacy_single_table_id = final_tid
 
             await _send(self.bot, MAIN_GROUP_ID,
                         f"🎯 Final table! {len(all_alive)} players remaining")
