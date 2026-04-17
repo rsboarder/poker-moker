@@ -337,6 +337,18 @@ def load_agents() -> list[AgentInfo]:
 # Data
 # ---------------------------------------------------------------------------
 
+from enum import Enum
+
+
+class TournamentState(str, Enum):
+    """Explicit lifecycle for the multi-table tournament coordinator."""
+    IDLE        = "idle"          # no tournament running
+    STARTING    = "starting"      # seating in progress, coordinator not yet scheduled
+    RUNNING     = "running"       # coordinator running, multiple tables may be active
+    FINAL_TABLE = "final_table"   # consolidated to one final table
+    COMPLETE    = "complete"      # winner crowned, awaiting reset to IDLE
+
+
 @dataclass
 class AgentInfo:
     player_id: int
@@ -938,6 +950,9 @@ class DealerBot:
         # Cleared on tournament start/stop.
         self._eliminated_announced: set[int] = set()
 
+        # Explicit tournament lifecycle state (see TournamentState enum).
+        self._tournament_state: TournamentState = TournamentState.IDLE
+
     def _find_table_for_user(self, username: str) -> "TableSession | None":
         """Return the TableSession where this username is a player."""
         username_lc = username.lower()
@@ -948,14 +963,9 @@ class DealerBot:
         return None
 
     def _is_game_active(self) -> bool:
-        """Tournament is active if the coordinator task is still running.
-        (Individual table states flicker through SHOWDOWN between rounds.)"""
-        if self._tournament_task and not self._tournament_task.done():
-            return True
-        # Also consider active if any table task is running
-        if any(not t.done() for t in self._table_tasks.values()):
-            return True
-        return False
+        """Tournament is active unless we are IDLE or COMPLETE.
+        Avoids inspecting task states, which flicker during scheduling windows."""
+        return self._tournament_state not in (TournamentState.IDLE, TournamentState.COMPLETE)
 
     # ------------------------------------------------------------------
     # WS broadcast helpers
@@ -1144,6 +1154,7 @@ class DealerBot:
                 f"WS: {len(ws_usernames)}, Telegram: {len(tg_usernames)}")
             return
 
+        self._tournament_state = TournamentState.STARTING
         agents = self._build_tournament_agents(sorted(player_usernames))
         table_size, num_tables = self._seat_and_init_tables(agents)
 
@@ -1158,6 +1169,7 @@ class DealerBot:
             f"Starting stack: {STARTING_STACK} chips\n"
             f"Blinds: {sb}/{bb}"
         )
+        self._tournament_state = TournamentState.RUNNING
         self._tournament_task = asyncio.create_task(self._run_tournament())
 
     async def cmd_stopgame(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1167,7 +1179,7 @@ class DealerBot:
             await update.message.reply_text("⚠️ Only admins can stop the game.")
             return
 
-        await self._stop_all_tables()
+        await self._reset_tournament_state()
         log.info("=== TOURNAMENT STOPPED by @%s ===",
                  update.effective_user.username if update.effective_user else "unknown")
 
@@ -1176,17 +1188,50 @@ class DealerBot:
         )
 
     async def _stop_all_tables(self):
-        """Cancel all table tasks and tournament coordinator, stop all TableSessions."""
-        if self._tournament_task and not self._tournament_task.done():
+        """Cancel all table tasks and tournament coordinator, stop all TableSessions.
+        Self-aware: if called from within the coordinator task itself, does NOT
+        cancel that task (would deadlock)."""
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if (
+            self._tournament_task
+            and not self._tournament_task.done()
+            and self._tournament_task is not current
+        ):
             self._tournament_task.cancel()
         for task in self._table_tasks.values():
-            if not task.done():
+            if not task.done() and task is not current:
                 task.cancel()
         for t in self.tables.values():
             t.stop()
             t.engine.state = GameState.WAITING
         self._table_tasks.clear()
-        self._tournament_task = None
+        if self._tournament_task is not current:
+            self._tournament_task = None
+
+    async def _reset_tournament_state(self):
+        """Unified reset: cancel tasks, clear tables/eliminations/blinds, reset
+        spectator state to 'waiting', transition back to IDLE.
+        Safe to call from TG stop path, HTTP stop path, or coordinator failure handler."""
+        await self._stop_all_tables()
+        self.tables.clear()
+        self._global_round_count = 0
+        self._eliminated_announced.clear()
+        self._tournament_state = TournamentState.IDLE
+        with _spectator_lock:
+            _spectator_state["game_state"] = "waiting"
+            _spectator_state["street"] = "waiting"
+            _spectator_state["pot"] = 0
+            _spectator_state["community_cards"] = []
+            _spectator_state["players"] = []
+            _spectator_state["current_player"] = None
+            _spectator_state["showdown_result"] = None
+            _spectator_state["last_actions"] = {}
+            _spectator_state["tables"] = {}
+            _spectator_state["table_count"] = 0
+            _spectator_state["timestamp"] = int(time.time())
 
     # ------------------------------------------------------------------
     # Multi-table helpers
@@ -1273,12 +1318,14 @@ class DealerBot:
         if self._is_game_active():
             return {"ok": False, "error": "Tournament already in progress"}
 
+        self._tournament_state = TournamentState.STARTING
         agents = self._build_tournament_agents(sorted(ws_usernames))
         table_size, num_tables = self._seat_and_init_tables(agents)
 
         sb, bb = get_blinds(1)
         log.info("=== TOURNAMENT START via HTTP: %d players, %d table(s) of %d ===",
                  len(agents), num_tables, table_size)
+        self._tournament_state = TournamentState.RUNNING
         self._tournament_task = asyncio.create_task(self._run_tournament())
         return {
             "ok": True,
@@ -1290,23 +1337,8 @@ class DealerBot:
         }
 
     async def trigger_stopgame(self) -> dict:
-        await self._stop_all_tables()
         log.info("=== TOURNAMENT STOPPED via HTTP ===")
-        self.tables.clear()
-        self._global_round_count = 0
-        self._eliminated_announced.clear()
-        with _spectator_lock:
-            _spectator_state["game_state"] = "waiting"
-            _spectator_state["street"] = "waiting"
-            _spectator_state["pot"] = 0
-            _spectator_state["community_cards"] = []
-            _spectator_state["players"] = []
-            _spectator_state["current_player"] = None
-            _spectator_state["showdown_result"] = None
-            _spectator_state["last_actions"] = {}
-            _spectator_state["tables"] = {}
-            _spectator_state["table_count"] = 0
-            _spectator_state["timestamp"] = int(time.time())
+        await self._reset_tournament_state()
         return {"ok": True}
 
     async def cmd_newtournament(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1569,7 +1601,9 @@ class DealerBot:
                 if len(alive) <= 1:
                     break
 
-            # Tournament over
+            # Tournament over — mark COMPLETE before writing the spectator signal so
+            # a poll racing with this transition sees _is_game_active() == False.
+            self._tournament_state = TournamentState.COMPLETE
             alive = [a for a in agents if a.stack > 0]
             winner = alive[0] if alive else max(agents, key=lambda a: a.stack)
             log.info("=== TOURNAMENT OVER. Winner: @%s ===", winner.username)
@@ -1590,6 +1624,7 @@ class DealerBot:
 
         except asyncio.CancelledError:
             log.info("Tournament coordinator cancelled")
+            # State will be reset to IDLE by the stop path that cancelled us
             raise
         except Exception as e:
             log.error("Tournament crashed: %s", e, exc_info=True)
@@ -1597,6 +1632,11 @@ class DealerBot:
                 await _send(self.bot, MAIN_GROUP_ID, f"❌ Tournament error: {e}")
             except Exception:
                 pass
+        finally:
+            # COMPLETE → IDLE after a brief settle so HTTP /state callers can still
+            # see "tournament_over" display string; next /startgame can proceed.
+            if self._tournament_state == TournamentState.COMPLETE:
+                self._tournament_state = TournamentState.IDLE
 
     async def _run_table_loop(self, table_id: int):
         """Run rounds at one table until ≤1 player remains at that table OR
@@ -1737,6 +1777,7 @@ class DealerBot:
             final.engine.set_blinds(*get_blinds(max(1, self._global_round_count)))
             self.tables[final_tid] = final
 
+            self._tournament_state = TournamentState.FINAL_TABLE
             await _send(self.bot, MAIN_GROUP_ID,
                         f"🎯 Final table! {len(all_alive)} players remaining")
             await self._broadcast_to_players(
