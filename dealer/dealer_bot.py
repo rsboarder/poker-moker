@@ -1038,6 +1038,22 @@ class DealerBot:
         except Exception:
             pass
 
+    def _live_ws_usernames(self) -> set[str]:
+        """Return usernames whose WS socket is still open.
+        Filters out dead mappings that the per-connection cleanup hasn't processed yet
+        (e.g., bot disconnected just before /startgame)."""
+        live: set[str] = set()
+        for username, ws in list(self.ws_connections.items()):
+            # websockets v12+: ws.state == 1 is OPEN; older API: ws.open
+            is_open = getattr(ws, "open", None)
+            if is_open is None:
+                # Fallback: no reliable attribute — assume open (worst case is a
+                # duplicate disconnect detected at first send, which is handled)
+                is_open = True
+            if is_open:
+                live.add(username)
+        return live
+
     # ------------------------------------------------------------------
     # WebSocket handler
     # ------------------------------------------------------------------
@@ -1226,7 +1242,7 @@ class DealerBot:
             return
 
         # Build roster from WS-connected bots (primary) + Telegram-registered (fallback)
-        ws_usernames = set(self.ws_connections.keys())
+        ws_usernames = self._live_ws_usernames()
         tg_usernames = {a.username.lower() for a in self.agents}
 
         if ws_usernames:
@@ -1419,7 +1435,7 @@ class DealerBot:
     # ------------------------------------------------------------------
 
     async def trigger_startgame(self) -> dict:
-        ws_usernames = set(self.ws_connections.keys())
+        ws_usernames = self._live_ws_usernames()
         if len(ws_usernames) < 2:
             return {"ok": False, "error": f"Need at least 2 players, {len(ws_usernames)} connected"}
         if self._is_game_active():
