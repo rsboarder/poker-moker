@@ -65,9 +65,9 @@ Keep the WebSocket connection open. All game communication happens on this singl
   "hole_cards": ["Ah", "Kd"],
   "position": "BTN",
   "players": [
-    {"username": "aggressor", "stack": 850, "street_bet": 120, "status": "active"},
-    {"username": "conservative", "stack": 970, "street_bet": 0, "status": "active"},
-    {"username": "mybot", "stack": 970, "street_bet": 0, "status": "active"}
+    {"id": 1, "username": "aggressor",    "stack": 850, "street_bet": 120, "status": "active"},
+    {"id": 2, "username": "conservative", "stack": 970, "street_bet": 0,   "status": "active"},
+    {"id": 3, "username": "mybot",        "stack": 970, "street_bet": 0,   "status": "active"}
   ],
   "valid_actions": ["fold", "call 120", "raise 240-970"],
   "to_call": 120,
@@ -76,19 +76,27 @@ Keep the WebSocket connection open. All game communication happens on this singl
 ```
 
 Fields:
-- `turn_id` — must include in your reply
+- `turn_id` — must include in your reply. Unique per table; stale IDs are rejected.
+- `table_id` — which table this turn belongs to (relevant in multi-table tournaments; safe to ignore if you don't care)
 - `street` — `preflop`, `flop`, `turn`, `river`
 - `pot` — current pot size
 - `stack` — your remaining chips
 - `community` — board cards
 - `hole_cards` — your hole cards (included so you don't need to track state)
-- `position` — your seat: `SB` (small blind), `BB` (big blind), `UTG` (under the gun, first after BB), `MP` (middle), `CO` (cutoff, before button), `BTN` (button/dealer, best position)
-- `players` — all players at the table with their stacks, current street bets, and status
-- `valid_actions` — what you can do (human-readable)
+- `position` — your seat at the current table. Possible values depend on table size:
+  - 2 players (heads-up): `SB`, `BB`
+  - 3 players: `SB`, `BB`, `BTN`
+  - 4 players: `SB`, `BB`, `CO`, `BTN`
+  - 5 players: `SB`, `BB`, `UTG`, `CO`, `BTN`
+  - 6+ players: `SB`, `BB`, `UTG`, `MP`, `CO`, `BTN`
+- `players` — all players at the current table. Each has `id` (player_id — used in `eliminated` and cross-referenced in event broadcasts), `username`, `stack`, `street_bet` (chips put in this street), and `status` (`active` / `folded` / `all_in`).
+- `valid_actions` — what you can do (human-readable strings)
 - `to_call` — chips needed to call (0 = can check)
-- `min_raise` — minimum raise-to amount
+- `min_raise` — minimum raise-to amount (total bet after your raise)
 
 ### 3. `event` — other players' actions, board updates
+
+Scoped to the table you're sitting at. You will **not** receive events from other tables in a multi-table tournament.
 
 ```json
 {
@@ -144,20 +152,39 @@ Sent after showdown, before the next round starts. Use this to update opponent t
 }
 ```
 
-### 5. `eliminated` — you're out
+### 6. `eliminated` — you're out
 
 ```json
 {"type": "eliminated", "place": 12, "players_left": 18}
 ```
 
-### 6. `tournament_start` / `tournament_over`
+**Note:** `place` is the number of players eliminated so far (1-indexed), not your finishing position. For an 18-player tournament, `place: 12` means "the 12th player to bust out" — your finishing rank is `total_players - place + 1`. `players_left` is the count still alive after your elimination.
+
+### 7. `tournament_start` / `tournament_over`
+
+Sent to every WS-connected bot when the tournament begins / ends.
 
 ```json
 {"type": "tournament_start", "players": 30, "tables": 5, "your_table": 2}
-{"type": "tournament_over", "winner": "botname"}
+{"type": "tournament_over", "winner": "botname", "winner_id": 2, "stack": 30000}
 ```
 
-### 7. `error` — something went wrong
+`your_table` is the table you've been seated at initially. You can ignore it — all subsequent `turn`, `cards`, `event`, and `showdown` messages tell you everything you need. Use only if you want to log or debug.
+
+### 8. `table_change` — you've been moved (multi-table only)
+
+When a table runs out of players, survivors are moved to another table. When the tournament consolidates to one final table, every remaining player is moved there.
+
+```json
+{"type": "table_change", "new_table": 2}
+{"type": "table_change", "new_table": 1, "reason": "final_table"}
+```
+
+`reason: "final_table"` is only sent when the final table is formed. Otherwise the field is absent.
+
+You don't need to do anything — the dealer will start sending you `turn` messages from the new table automatically. The `table_id` inside each subsequent `turn` will reflect your new seating.
+
+### 9. `error` — something went wrong
 
 ```json
 {"type": "error", "text": "not your turn"}
@@ -186,7 +213,20 @@ Actions:
 
 ### Timeout
 
-If you don't reply within 5 seconds, dealer auto-plays: check if possible, fold otherwise.
+If you don't reply within 5 seconds, dealer auto-plays: check if possible, fold otherwise. A 0.5s safety delay follows each auto-action (to prevent runaway loops when many bots disconnect at once).
+
+## Multi-table tournaments
+
+Tournaments with more players than fit at one table are run across multiple tables in parallel. **Your bot needs no special handling** — just respond to `turn` messages as usual.
+
+What happens automatically:
+- At tournament start you're seated at one table (random). You receive `tournament_start` with `your_table` (informational only).
+- Each table runs its own round independently; blind levels increase simultaneously across all tables.
+- All `turn`, `cards`, `event`, `showdown`, `round_end` messages include `table_id` so you know which table they're about. But since you're only ever seated at one table at a time, you normally just process them in order.
+- When your table closes (down to 1 survivor) or the tournament consolidates to a final table, you receive `table_change` with your new `table_id`. Continue as normal.
+- `event` messages are **scoped to your table** — you don't see what's happening at other tables.
+
+You can safely ignore `table_id` entirely if your strategy doesn't care about it.
 
 ## Reconnecting
 
@@ -264,6 +304,6 @@ python bot.py --team MyBot --invite POKER-XXXX
 
 # Terminal 3: start a dummy opponent
 cd dealer && python test_dummy_bot.py --team Opponent --invite POKER-XXXX
-
-# In Telegram: /startgame
 ```
+
+Then trigger the tournament from the web control panel at `http://localhost:8765/control` (click **Start Game**). The spectator view is at `http://localhost:8765/`. Telegram is optional — the dealer runs headless if `DEALER_BOT_TOKEN` isn't configured.
