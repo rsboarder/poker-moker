@@ -67,24 +67,63 @@ _spectator_state: dict = {
     "showdown_result": None,
     "recent_events": [],
     "timestamp": 0,
+    "ws_players": [],
 }
 _spectator_lock = threading.Lock()
+
+# References set in async_main — used by the HTTP handler thread
+_dealer_ref: "DealerBot | None" = None
+_loop_ref:   asyncio.AbstractEventLoop | None = None
 
 
 class _SpectatorHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # silence request logs
 
+    def _send_json(self, code: int, data: dict):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.end_headers()
+
+    def do_POST(self):
+        if _dealer_ref is None or _loop_ref is None:
+            self._send_json(503, {"error": "dealer not ready"})
+            return
+        if self.path == "/startgame":
+            future = asyncio.run_coroutine_threadsafe(
+                _dealer_ref.trigger_startgame(), _loop_ref
+            )
+            try:
+                result = future.result(timeout=10)
+                self._send_json(200 if result.get("ok") else 400, result)
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+        elif self.path == "/stopgame":
+            future = asyncio.run_coroutine_threadsafe(
+                _dealer_ref.trigger_stopgame(), _loop_ref
+            )
+            try:
+                result = future.result(timeout=10)
+                self._send_json(200, result)
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+        else:
+            self._send_json(404, {"error": "not found"})
+
     def do_GET(self):
         if self.path == "/state":
             with _spectator_lock:
-                body = json.dumps(_spectator_state).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+                self._send_json(200, _spectator_state)
         elif self.path in ("/", "/index.html"):
             if _SPECTATOR_HTML.exists():
                 body = _SPECTATOR_HTML.read_bytes()
@@ -776,6 +815,8 @@ class DealerBot:
             if username and username in self.ws_connections:
                 del self.ws_connections[username]
                 log.info("WS disconnected: %s (%d online)", username, len(self.ws_connections))
+                with _spectator_lock:
+                    _spectator_state["ws_players"] = list(self.ws_connections.keys())
 
     async def _ws_register(self, ws, msg: dict) -> str | None:
         """Handle registration message. Returns username on success."""
@@ -819,6 +860,8 @@ class DealerBot:
         self.ws_connections[username] = ws
 
         log.info("WS registered: %s (%d online)", username, len(self.ws_connections))
+        with _spectator_lock:
+            _spectator_state["ws_players"] = list(self.ws_connections.keys())
         await ws.send(json.dumps({
             "type": "registered",
             "username": username,
@@ -941,6 +984,51 @@ class DealerBot:
         await update.message.reply_text(
             "🛑 Tournament stopped. Send /startgame to start a new one."
         )
+
+    # ------------------------------------------------------------------
+    # HTTP control API (called from spectator server thread via run_coroutine_threadsafe)
+    # ------------------------------------------------------------------
+
+    async def trigger_startgame(self) -> dict:
+        ws_usernames = set(self.ws_connections.keys())
+        if len(ws_usernames) < 2:
+            return {"ok": False, "error": f"Need at least 2 players, {len(ws_usernames)} connected"}
+        if self.table and self.table.engine.state not in (GameState.WAITING, GameState.SHOWDOWN):
+            return {"ok": False, "error": "Tournament already in progress"}
+
+        self._tournament_agents = []
+        for pid, username in enumerate(sorted(ws_usernames), start=1):
+            tg_agent = self._by_username.get(username)
+            self._tournament_agents.append(AgentInfo(
+                player_id=pid,
+                username=username,
+                private_group_id=tg_agent.private_group_id if tg_agent else 0,
+                stack=STARTING_STACK,
+            ))
+
+        self.table = TableSession(
+            table_id=1, agents=self._tournament_agents, bot=self.bot,
+            ws_connections=self.ws_connections,
+        )
+        sb, bb = get_blinds(1)
+        log.info("=== TOURNAMENT START via HTTP: %d players stacks=%d ===",
+                 len(self._tournament_agents), STARTING_STACK)
+        self._round_task = asyncio.create_task(self._run_tournament())
+        return {
+            "ok": True,
+            "players": [a.username for a in self._tournament_agents],
+            "blinds": f"{sb}/{bb}",
+            "starting_stack": STARTING_STACK,
+        }
+
+    async def trigger_stopgame(self) -> dict:
+        if self._round_task and not self._round_task.done():
+            self._round_task.cancel()
+            log.info("=== TOURNAMENT STOPPED via HTTP ===")
+        if self.table:
+            self.table.stop()
+            self.table.engine.state = GameState.WAITING
+        return {"ok": True}
 
     async def cmd_newtournament(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Create a new tournament with a unique registration code."""
@@ -1316,6 +1404,10 @@ async def async_main():
 
     dealer = DealerBot(agents)
     app = _build_app(dealer)
+
+    global _dealer_ref, _loop_ref
+    _dealer_ref = dealer
+    _loop_ref   = asyncio.get_event_loop()
 
     _start_spectator_server()
 
