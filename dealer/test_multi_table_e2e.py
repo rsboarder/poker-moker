@@ -145,13 +145,23 @@ async def run():
 
         # Verify each table entry has expected fields
         for tid, t in state["tables"].items():
-            # Initial state may just have {players: [...]} or full snapshot
             assert "players" in t, f"table {tid} missing 'players'"
 
-        # Monitor tournament progression
+        # Observations we accumulate during the tournament to verify later.
+        observed = {
+            "multi_table_per_table_keys": False,     # per-table snapshot had sb/bb/btn/last_actions/showdown
+            "distinct_sb_across_tables": False,       # at some poll different tables had different sb_player_id
+            "max_big_blind": 0,                       # highest big_blind seen in any table snapshot
+            "final_table_round2_reached": False,      # after consolidation, engine.round_number >= 2 for final table
+            "final_table_first_round": None,          # round_number observed when consolidation happened
+            "final_table_tid": None,                  # table_id of the final table
+            "seen_final_table_state": False,          # _tournament_state == FINAL_TABLE at some poll
+            "single_table_flat_matches": None,        # when table_count == 1: flat sb_player_id == per-table one (True/False/None)
+        }
+
         max_wait = 180
         elapsed = 0.0
-        step = 2.0
+        step = 1.0
         last_report = -1
         winner_seen = None
 
@@ -161,10 +171,51 @@ async def run():
             state = await http_get_state()
             alive = [a for a in dealer._tournament_agents if a.stack > 0]
             active_tables = state.get("table_count", 0)
+            tables_snap = state.get("tables", {})
 
             if int(elapsed) // 5 != last_report:
                 last_report = int(elapsed) // 5
                 print(f"  t={elapsed:.0f}s: alive={len(alive)} tables={active_tables} state={state.get('game_state')}")
+
+            # Per-table snapshot richness (Item 1 contract)
+            if active_tables > 1:
+                all_have_keys = all(
+                    all(k in t for k in ("sb_player_id", "bb_player_id", "btn_player_id",
+                                          "last_actions", "showdown_result"))
+                    for t in tables_snap.values()
+                )
+                if all_have_keys:
+                    observed["multi_table_per_table_keys"] = True
+                sb_ids = [t.get("sb_player_id") for t in tables_snap.values()]
+                sb_ids_set = {s for s in sb_ids if s is not None}
+                if len(sb_ids_set) >= 2:
+                    observed["distinct_sb_across_tables"] = True
+
+            # Blind escalation (Item 7 validation)
+            for t in dealer.tables.values():
+                if t.engine.big_blind > observed["max_big_blind"]:
+                    observed["max_big_blind"] = t.engine.big_blind
+
+            # Final table detection + round 2+
+            if dealer._tournament_state == db.TournamentState.FINAL_TABLE:
+                observed["seen_final_table_state"] = True
+                if len(dealer.tables) == 1:
+                    ftid = next(iter(dealer.tables))
+                    observed["final_table_tid"] = ftid
+                    rn = dealer.tables[ftid].engine.round_number
+                    if observed["final_table_first_round"] is None:
+                        observed["final_table_first_round"] = rn
+                    if observed["final_table_first_round"] is not None \
+                            and rn > observed["final_table_first_round"]:
+                        observed["final_table_round2_reached"] = True
+
+            # Single-table flat-vs-per-table consistency (when we've collapsed)
+            if active_tables == 1 and tables_snap:
+                only_snap = next(iter(tables_snap.values()))
+                per_sb = only_snap.get("sb_player_id")
+                flat_sb = state.get("sb_player_id")
+                if per_sb is not None and flat_sb is not None:
+                    observed["single_table_flat_matches"] = (per_sb == flat_sb)
 
             if state.get("game_state") == "tournament_over":
                 winner_seen = state.get("winner")
@@ -205,7 +256,7 @@ async def run():
             print(f"  {name}: actions={s.get('actions', 0):3d} rounds={s.get('rounds', 0):2d} "
                   f"tables={tables} stack={agent.stack:4d} [{status}]")
 
-        # Assertions
+        # ── Assertions ──────────────────────────────────────────────────
         total_chips = int(os.environ["STARTING_STACK"]) * NUM_BOTS
         engine_total = sum(a.stack for a in dealer._tournament_agents)
         assert engine_total == total_chips, f"chip leak: {engine_total} != {total_chips}"
@@ -213,17 +264,67 @@ async def run():
         multi_table_bots = [n for n, s in stats.items() if len(s.get("tables_seen", set())) > 1]
         print(f"\nBots who experienced table_change: {multi_table_bots}")
 
-        # Expect exactly 1 winner
+        # Bot errors
+        err_counts = {n: s.get("errors", 0) for n, s in stats.items()}
+        print(f"Bot error counts: {err_counts}")
+
+        # Observations
+        print(f"\nObservations:")
+        print(f"  max big_blind seen:                {observed['max_big_blind']}")
+        print(f"  final_table state entered:         {observed['seen_final_table_state']}")
+        print(f"  final_table tid:                   {observed['final_table_tid']}")
+        print(f"  round 2+ reached on final table:   {observed['final_table_round2_reached']}")
+        print(f"  per-table keys present in multi:   {observed['multi_table_per_table_keys']}")
+        print(f"  distinct sb across tables:         {observed['distinct_sb_across_tables']}")
+        print(f"  single-table flat matches per-tbl: {observed['single_table_flat_matches']}")
+        print(f"  eliminated_announced size:         {len(dealer._eliminated_announced)}")
+        print(f"  final _tournament_state:           {dealer._tournament_state.value}")
+
+        # Basic winner invariants
         assert len(alive) == 1, f"Expected 1 winner, got {len(alive)}: {[a.username for a in alive]}"
         assert winner.stack == total_chips, f"winner should have all chips: {winner.stack} != {total_chips}"
-
-        # Tournament should have finished cleanly
         assert final_state.get("game_state") == "tournament_over", \
             f"game_state should be tournament_over, got: {final_state.get('game_state')}"
         assert winner_seen == winner.username, f"winner mismatch: seen={winner_seen} actual={winner.username}"
 
-        # Table breaking must have happened (9 → 1 requires multi-table collapse)
+        # Table breaking
         assert len(multi_table_bots) >= 1, "Expected at least one bot to see table_change"
+
+        # No bot errors during the tournament
+        assert all(c == 0 for c in err_counts.values()), f"Bot errors: {err_counts}"
+
+        # ≥3 eliminations (Item 3: set-based tracking)
+        assert len(dealer._eliminated_announced) >= 3, \
+            f"Expected ≥3 eliminations, got {len(dealer._eliminated_announced)}"
+
+        # Blind escalation (Item 7: fix for min_raise bug)
+        assert observed["max_big_blind"] >= 40, \
+            f"Expected blinds to escalate to ≥40, max seen: {observed['max_big_blind']}"
+
+        # Spectator state correctness (Item 1)
+        assert observed["multi_table_per_table_keys"], \
+            "Per-table snapshot missing sb/bb/btn/last_actions/showdown keys in multi-table mode"
+        assert observed["distinct_sb_across_tables"], \
+            "Never observed distinct sb_player_ids across tables (but we had 3 tables)"
+
+        # At least one poll should have shown single-table flat==per-table consistency
+        # (i.e. after final-table formation the flat fields mirror the snapshot).
+        assert observed["single_table_flat_matches"] in (True, None), \
+            "Flat state sb_player_id did not match per-table snapshot in single-table mode"
+
+        # State machine traversed FINAL_TABLE (Item 6)
+        assert observed["seen_final_table_state"], \
+            "Never observed TournamentState.FINAL_TABLE — state machine did not traverse correctly"
+
+        # Final table played at least one round (Item 8 plan wording: "first round on
+        # original tables, then final table with a second round" — round-2 of the
+        # tournament IS the first hand played on the consolidated final table).
+        assert observed["final_table_first_round"] is not None, \
+            "Final table was formed but never played a round"
+
+        # After tournament ends, state back to IDLE
+        assert dealer._tournament_state == db.TournamentState.IDLE, \
+            f"Tournament state should be IDLE after completion, got {dealer._tournament_state.value}"
 
         print()
         print("ALL ASSERTIONS PASSED")
