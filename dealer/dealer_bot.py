@@ -539,11 +539,10 @@ class TableSession:
             "players": players_final,
         })
 
-        # Signal the coordinator: a hand just finished. It will re-evaluate
-        # whether consolidation (final-table formation) is now appropriate,
-        # even if this table didn't break.
-        if self._dealer is not None:
-            self._dealer._coordinator_tick.set()
+        # NOTE: The coordinator tick is fired by _run_table_loop AFTER stack
+        # synchronization — firing it here would wake the coordinator on stale
+        # AgentInfo.stack values (still showing last hand's totals), which
+        # would cause incorrect consolidation decisions.
 
     async def _dispatch_events(self, events: list[GameEvent]):
         """Route GameEvents to appropriate Telegram chats and WS connections."""
@@ -698,10 +697,12 @@ class TableSession:
             min_raise = max_bet + self.engine.big_blind
             player_total = (player.stack + player.street_bet) if player else 0
 
-            # Short-stack guard: if player can't afford a legal min_raise, drop
-            # the 'raise' option entirely (prevents bots from sending invalid
-            # raises based on advertised-but-impossible range like "raise 240-170").
-            can_raise = player_total >= min_raise
+            # NLHE rules:
+            #  - A full raise (≥ min_raise) is always legal if player has enough.
+            #  - A short-stack all-in is legal even below min_raise.
+            # We advertise only the legal range.
+            can_raise_full = player_total >= min_raise
+            can_all_in = player_total > max_bet  # enough to be a raise at all
 
             valid_actions: list[str] = []
             if to_call > 0:
@@ -709,8 +710,11 @@ class TableSession:
                 valid_actions.append(f"call {to_call}")
             else:
                 valid_actions.append("check")
-            if can_raise:
+            if can_raise_full:
                 valid_actions.append(f"raise {min_raise}-{player_total}")
+            elif can_all_in:
+                # Short-stack all-in only (cannot make a full min_raise)
+                valid_actions.append(f"raise {player_total} (all-in)")
 
             # Build players list with stacks and status
             players_info = []
@@ -1867,11 +1871,16 @@ class DealerBot:
                 await table.run_single_round(rotated, new_sb, new_bb)
                 dealer_idx += 1
 
-                # Sync stacks engine → agents
+                # Sync stacks engine → agents. MUST happen before the coordinator
+                # tick so the coordinator sees authoritative state.
                 for p in table.engine.players:
                     agent = table._by_player_id.get(p.id)
                     if agent:
                         agent.stack = p.stack
+
+                # Signal the coordinator: a hand just finished WITH committed
+                # stacks. It will re-evaluate consolidation / breaking decisions.
+                self._coordinator_tick.set()
 
                 # Pause between rounds
                 with _spectator_lock:
