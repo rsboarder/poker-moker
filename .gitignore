@@ -9,6 +9,7 @@ __pycache__/
 # Game data (regenerated each tournament)
 data/
 logs/
+dealer/registrations.json
 
 # OS
 .DS_Store
