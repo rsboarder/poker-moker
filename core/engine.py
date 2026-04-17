@@ -190,7 +190,7 @@ class GameEngine:
 
         elif action == "raise":
             max_street_bet = max(pl.street_bet for pl in self.players)
-            min_raise = max_street_bet + BIG_BLIND
+            min_raise = max_street_bet + self.big_blind
             total_needed = amount  # amount = total bet this street after raise
 
             if amount < min_raise:
