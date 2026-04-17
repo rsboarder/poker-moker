@@ -3,306 +3,730 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Poker — Control Panel</title>
+<title>AICollective Poker — Spectator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700;900&family=Cormorant+SC:wght@300;400;600&family=Courier+Prime:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:          #060e08;
+    --felt-c:      #1b6038;
+    --felt-m:      #124728;
+    --felt-e:      #092818;
+    --rim:         #b8952a;
+    --rim-hi:      #ddb93a;
+    --gold:        #c9a227;
+    --gold-dim:    rgba(201,162,39,.2);
+    --gold-glow:   rgba(201,162,39,.45);
+    --text:        #e3d6bf;
+    --text-dim:    #6a6050;
+    --card-face:   #f8f4ec;
+    --card-red:    #c02828;
+    --card-blk:    #181830;
+    --active-glow: 0 0 0 2px var(--gold), 0 0 18px var(--gold-glow), 0 0 40px rgba(201,162,39,.2);
+    --glass:       rgba(8,20,11,.72);
+    --glass-b:     rgba(201,162,39,.18);
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
   body {
-    background: #0d1117;
-    color: #e6edf3;
-    font-family: 'SF Mono', 'Fira Code', monospace;
-    font-size: 14px;
-    padding: 20px;
+    background: var(--bg);
+    background-image:
+      radial-gradient(ellipse 70% 50% at 50% 50%, rgba(18,80,42,.18) 0%, transparent 70%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)' opacity='.028'/%3E%3C/svg%3E");
+    font-family: 'Cormorant SC', serif;
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    user-select: none;
   }
-  h1 { font-size: 18px; color: #f0c040; margin-bottom: 16px; letter-spacing: 1px; }
-  .grid { display: grid; grid-template-columns: 280px 1fr; gap: 16px; }
-  .card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    padding: 16px;
-  }
-  .card h2 { font-size: 11px; text-transform: uppercase; color: #8b949e; letter-spacing: 1px; margin-bottom: 12px; }
-  .status-dot {
-    display: inline-block; width: 8px; height: 8px;
-    border-radius: 50%; margin-right: 6px;
-  }
-  .dot-green { background: #3fb950; }
-  .dot-yellow { background: #d29922; }
-  .dot-red { background: #f85149; }
-  .dot-gray { background: #484f58; }
 
-  /* Players list */
-  .player-row {
+  /* ── HEADER ─────────────────────────────────────────── */
+  header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 6px 0; border-bottom: 1px solid #21262d;
+    padding: 13px 28px;
+    border-bottom: 1px solid rgba(201,162,39,.12);
+    flex-shrink: 0;
+    background: rgba(4,10,5,.6);
+    backdrop-filter: blur(6px);
   }
-  .player-row:last-child { border-bottom: none; }
-  .player-name { color: #58a6ff; }
-  .player-stack { color: #3fb950; font-weight: bold; }
-  .stack-bar {
-    height: 4px; background: #21262d; border-radius: 2px;
-    margin-top: 4px; overflow: hidden;
-  }
-  .stack-fill { height: 100%; background: #3fb950; border-radius: 2px; transition: width 0.4s; }
+  .h-brand { font-family:'Cinzel',serif; font-size:15px; font-weight:900; letter-spacing:.22em; text-transform:uppercase; color:var(--gold); }
+  .h-brand em { color:var(--text-dim); font-style:normal; font-weight:400; }
+  .h-center { display:flex; align-items:center; gap:20px; }
+  .h-pill { font-family:'Cinzel',serif; font-size:11px; font-weight:700; letter-spacing:.22em; color:var(--gold); border:1px solid rgba(201,162,39,.5); padding:4px 14px; text-transform:uppercase; border-radius:2px; transition:all .4s ease; }
+  .h-stat { font-size:12px; letter-spacing:.08em; color:var(--text-dim); }
+  .h-stat strong { color:var(--text); font-size:13px; }
+  .h-ctrl { font-family:'Cinzel',serif; font-size:10px; font-weight:700; letter-spacing:.18em; color:rgba(201,162,39,.5); border:1px solid rgba(201,162,39,.2); padding:4px 12px; text-transform:uppercase; border-radius:2px; text-decoration:none; transition:all .25s ease; }
+  .h-ctrl:hover { color:var(--gold); border-color:rgba(201,162,39,.5); }
+  .live { display:flex; align-items:center; gap:7px; font-size:11px; letter-spacing:.18em; color:#d9534f; font-weight:700; }
+  .live-dot { width:7px; height:7px; border-radius:50%; background:#d9534f; animation:livepulse 1.6s ease-in-out infinite; }
+  @keyframes livepulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(1.4)} }
 
-  /* Game state */
-  .state-badge {
-    display: inline-block; padding: 2px 10px; border-radius: 12px;
-    font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;
-    margin-bottom: 10px;
-  }
-  .state-waiting { background: #21262d; color: #8b949e; }
-  .state-playing { background: #0d2f0d; color: #3fb950; }
-  .state-showdown { background: #2f1b0d; color: #f0c040; }
+  /* ── MAIN ────────────────────────────────────────────── */
+  .main { flex:1; display:flex; align-items:stretch; overflow:hidden; }
 
-  .info-row { display: flex; justify-content: space-between; padding: 4px 0; }
-  .info-label { color: #8b949e; }
-  .info-value { color: #e6edf3; }
+  /* ── TABLE ZONE ──────────────────────────────────────── */
+  .table-zone { flex:1; display:flex; align-items:center; justify-content:center; position:relative; overflow:hidden; }
 
-  /* Community cards */
-  .community { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-  .card-chip {
-    background: #21262d; border: 1px solid #30363d;
-    border-radius: 4px; padding: 4px 8px;
-    font-size: 13px; font-weight: bold;
-  }
-  .card-chip.hearts, .card-chip.diamonds { color: #f85149; }
-  .card-chip.spades, .card-chip.clubs { color: #e6edf3; }
+  .arena { position:relative; width:720px; height:480px; }
 
-  /* Controls */
-  .controls { display: flex; gap: 10px; margin-top: 14px; }
-  button {
-    flex: 1; padding: 10px; border: none; border-radius: 6px;
-    font-family: inherit; font-size: 13px; font-weight: bold;
-    cursor: pointer; transition: opacity 0.15s;
+  /* The felt */
+  .felt {
+    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    width:540px; height:280px; border-radius:50%;
+    background: radial-gradient(ellipse 60% 60% at 38% 42%, #2a7a4a 0%, #17573a 30%, #0e3d26 60%, var(--felt-e) 100%);
+    border:3px solid rgba(100,70,20,.6);
+    box-shadow:
+      0 0 0 8px #06100a, 0 0 0 10px rgba(184,149,42,.35), 0 0 0 13px #06100a,
+      0 0 0 18px rgba(184,149,42,.12), 0 25px 70px rgba(0,0,0,.75),
+      inset 0 2px 10px rgba(255,255,255,.04), inset 0 -3px 12px rgba(0,0,0,.4);
   }
-  button:hover { opacity: 0.85; }
-  button:disabled { opacity: 0.35; cursor: not-allowed; }
-  #btn-start { background: #238636; color: #fff; }
-  #btn-stop  { background: #da3633; color: #fff; }
+  .felt::before { content:''; position:absolute; inset:14px; border-radius:50%; border:1px solid rgba(255,255,255,.04); pointer-events:none; }
+  .felt::after { content:''; position:absolute; inset:0; border-radius:50%; background-image: repeating-linear-gradient(0deg,rgba(0,0,0,.015) 0px,transparent 1px,transparent 3px), repeating-linear-gradient(90deg,rgba(0,0,0,.015) 0px,transparent 1px,transparent 3px); pointer-events:none; }
 
-  /* Events log */
-  .events {
-    height: 220px; overflow-y: auto;
-    font-size: 12px; line-height: 1.6;
-  }
-  .events::-webkit-scrollbar { width: 4px; }
-  .events::-webkit-scrollbar-track { background: #161b22; }
-  .events::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
-  .event-line { padding: 2px 0; border-bottom: 1px solid #21262d; color: #8b949e; }
-  .event-line:last-child { border-bottom: none; }
-  .event-line .ts { color: #484f58; margin-right: 6px; }
+  /* Center content */
+  .table-center { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); display:flex; flex-direction:column; align-items:center; gap:14px; z-index:10; }
 
-  /* Showdown result */
-  .showdown-box {
-    margin-top: 12px; padding: 10px;
-    background: #1a1a0a; border: 1px solid #f0c040;
-    border-radius: 6px; font-size: 12px; line-height: 1.7;
-    white-space: pre-wrap;
+  /* ── COMMUNITY CARDS ─────────────────────────────────── */
+  .community { display:flex; gap:7px; align-items:center; }
+  .c-slot { width:46px; height:65px; border-radius:5px; background:rgba(0,0,0,.28); border:1px dashed rgba(255,255,255,.08); }
+
+  /* ── POT ─────────────────────────────────────────────── */
+  .pot-wrap { display:flex; align-items:center; gap:10px; background:rgba(0,0,0,.55); border:1px solid rgba(201,162,39,.25); border-radius:20px; padding:6px 18px; backdrop-filter:blur(4px); }
+  .pot-chips { display:flex; }
+  .chip-dot { width:13px; height:13px; border-radius:50%; border:2px solid rgba(255,255,255,.25); margin-left:-4px; }
+  .pot-lbl { font-size:10px; letter-spacing:.14em; color:var(--text-dim); text-transform:uppercase; }
+  .pot-val { font-family:'Courier Prime',monospace; font-weight:700; font-size:20px; color:var(--gold); transition:all .3s ease; }
+
+  /* ── CARDS ───────────────────────────────────────────── */
+  .card {
+    width:46px; height:65px; background:var(--card-face); border-radius:5px;
+    box-shadow:2px 4px 12px rgba(0,0,0,.65), 0 0 0 1px rgba(0,0,0,.18);
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1px;
+    /* NO default animation — only .card-new animates */
+  }
+  @keyframes deal { from{transform:scale(.7) translateY(-8px);opacity:0} to{transform:scale(1) translateY(0);opacity:1} }
+  .card-new { animation: deal .28s cubic-bezier(.2,.8,.4,1); }
+  .card.sm { width:40px; height:56px; }
+  .card-r { font-family:'Courier Prime',monospace; font-weight:700; font-size:17px; line-height:1; }
+  .card-s { font-size:13px; line-height:1; }
+  .card.sm .card-r { font-size:15px; }
+  .card.sm .card-s { font-size:11px; }
+  .card.red .card-r, .card.red .card-s { color:var(--card-red); }
+  .card.blk .card-r, .card.blk .card-s { color:var(--card-blk); }
+  .card.back { background:linear-gradient(135deg,#1a3a28 25%,#0f2418 25%,#0f2418 50%,#1a3a28 50%,#1a3a28 75%,#0f2418 75%); background-size:8px 8px; border:2px solid rgba(201,162,39,.3); }
+
+  /* ── PLAYER SEATS ────────────────────────────────────── */
+  .seat { position:absolute; display:flex; flex-direction:column; align-items:center; gap:0; }
+
+  .pod { background:var(--glass); border:1px solid var(--glass-b); border-radius:10px; padding:10px 14px; display:flex; flex-direction:column; align-items:center; gap:6px; backdrop-filter:blur(6px); transition:box-shadow .35s ease, opacity .35s ease, border-color .35s ease; min-width:115px; }
+  .seat.turn .pod { border-color:var(--gold); box-shadow:var(--active-glow); }
+  .seat.folded .pod { opacity:.32; }
+  .seat.allin .pod  { border-color:rgba(209,75,65,.5); }
+
+  .pod-top { display:flex; align-items:center; gap:5px; }
+  .p-cards { display:flex; gap:5px; }
+  .p-name { font-family:'Cinzel',serif; font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; color:var(--text); white-space:nowrap; max-width:120px; overflow:hidden; text-overflow:ellipsis; }
+  .p-stack { font-family:'Courier Prime',monospace; font-weight:700; font-size:15px; color:var(--gold); }
+  .p-bet { font-family:'Courier Prime',monospace; font-size:11px; color:var(--text-dim); }
+  .p-status { font-family:'Cinzel',serif; font-size:9px; font-weight:700; letter-spacing:.15em; text-transform:uppercase; padding:2px 8px; border-radius:2px; }
+  .s-active  { color:#2ecc71; }
+  .s-folded  { color:#666; }
+  .s-allin   { color:#e74c3c; background:rgba(231,76,60,.12); }
+
+  /* Last action label */
+  .p-action { font-family:'Courier Prime',monospace; font-size:11px; color:rgba(201,162,39,.65); letter-spacing:.04em; }
+
+  /* Blind badges in pod */
+  .p-blind { font-family:'Cinzel',serif; font-size:8px; font-weight:700; letter-spacing:.08em; padding:1px 5px; border-radius:2px; flex-shrink:0; }
+  .p-blind.sb { background:rgba(46,204,113,.15); color:#2ecc71; border:1px solid rgba(46,204,113,.3); }
+  .p-blind.bb { background:rgba(52,152,219,.15); color:#5dade2; border:1px solid rgba(52,152,219,.3); }
+
+  .turn-badge { font-family:'Cinzel',serif; font-size:9px; font-weight:900; letter-spacing:.2em; color:var(--gold); text-transform:uppercase; animation:blink 1s step-end infinite; visibility:hidden; }
+  .seat.turn .turn-badge { visibility:visible; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+  /* Dealer button chip on table */
+  .dealer-btn-chip {
+    position:absolute; z-index:8;
+    width:24px; height:24px; border-radius:50%;
+    background:#f0e8d4; color:#111;
+    font-family:'Cinzel',serif; font-size:9px; font-weight:900;
+    display:flex; align-items:center; justify-content:center;
+    border:2px solid rgba(200,160,40,.7);
+    box-shadow:0 2px 8px rgba(0,0,0,.6), 0 0 6px rgba(201,162,39,.25);
+    pointer-events:none;
+    transition:all .5s ease;
   }
 
-  /* Status bar */
-  .statusbar {
-    margin-top: 14px; font-size: 11px; color: #484f58;
-    display: flex; justify-content: space-between;
+  /* Bet chip on table */
+  .bet-chip {
+    position:absolute; font-family:'Courier Prime',monospace; font-size:10px; font-weight:700;
+    background:rgba(201,162,39,.18); border:1px solid rgba(201,162,39,.4); color:var(--gold);
+    border-radius:10px; padding:2px 7px; white-space:nowrap; z-index:5; pointer-events:none;
   }
-  #conn-status { }
-  #last-update { }
 
-  /* WS players online */
-  .online-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-  .online-chip {
-    background: #0d2f0d; border: 1px solid #3fb950;
-    color: #3fb950; border-radius: 12px; padding: 2px 10px; font-size: 12px;
+  /* ── LOG PANEL ───────────────────────────────────────── */
+  .log-panel { width:270px; flex-shrink:0; border-left:1px solid rgba(201,162,39,.1); background:rgba(4,10,5,.5); display:flex; flex-direction:column; overflow:hidden; backdrop-filter:blur(4px); }
+  .log-head { font-family:'Cinzel',serif; font-size:10px; font-weight:700; letter-spacing:.22em; color:var(--gold); text-transform:uppercase; padding:16px 18px 12px; border-bottom:1px solid rgba(201,162,39,.1); flex-shrink:0; }
+  .log-feed { flex:1; overflow:hidden; display:flex; flex-direction:column; gap:0; padding:10px 0; }
+  .log-item { padding:7px 18px; font-size:12px; line-height:1.55; color:var(--text-dim); border-left:2px solid transparent; transition:all .4s ease; flex-shrink:0; }
+  .log-item.fresh { color:var(--text); border-left-color:var(--gold); background:rgba(201,162,39,.05); animation:fadeIn .3s ease; }
+  @keyframes fadeIn { from{opacity:0;transform:translateX(4px)} to{opacity:1;transform:none} }
+  .log-item .log-who { color:var(--gold); font-weight:600; }
+
+  /* ── SHOWDOWN OVERLAY ────────────────────────────────── */
+  .showdown-overlay {
+    position:fixed; inset:0;
+    background:rgba(0,0,0,.72);
+    display:flex; align-items:center; justify-content:center;
+    z-index:100;
+    backdrop-filter:blur(5px);
+    opacity:1; transition:opacity .4s ease;
+    pointer-events:auto;
   }
-  .no-players { color: #484f58; font-size: 12px; }
+  .showdown-overlay.hidden { opacity:0; pointer-events:none; }
+  .showdown-card {
+    background:linear-gradient(135deg, rgba(10,24,14,.98) 0%, rgba(6,14,8,.98) 100%);
+    border:1px solid rgba(201,162,39,.45);
+    border-radius:14px; padding:38px 52px;
+    max-width:440px; min-width:320px;
+    text-align:center;
+    box-shadow:0 0 0 1px rgba(201,162,39,.1), 0 32px 80px rgba(0,0,0,.85), 0 0 60px rgba(201,162,39,.07);
+    animation:cardReveal .38s cubic-bezier(.2,.8,.4,1);
+  }
+  @keyframes cardReveal { from{transform:scale(.86) translateY(18px);opacity:0} to{transform:scale(1) translateY(0);opacity:1} }
+  .showdown-eyebrow { font-family:'Cinzel',serif; font-size:10px; font-weight:700; letter-spacing:.3em; color:rgba(201,162,39,.5); text-transform:uppercase; margin-bottom:14px; }
+  .showdown-content { font-family:'Courier Prime',monospace; font-size:16px; line-height:1.8; color:var(--text); white-space:pre-line; }
+  .showdown-bar-wrap { margin-top:24px; height:2px; background:rgba(201,162,39,.12); border-radius:1px; overflow:hidden; }
+  .showdown-bar { height:100%; background:var(--gold); width:100%; }
+  .showdown-bar.draining { transition:width 10s linear; width:0%; }
+
+  /* ── SHOWDOWN RICH LAYOUT ───────────────────────────── */
+  .showdown-card { max-width:580px; min-width:360px; padding:32px 44px; }
+
+  .sd-community {
+    display:flex; gap:7px; justify-content:center;
+    margin-bottom:18px; padding-bottom:16px;
+    border-bottom:1px solid rgba(201,162,39,.15);
+  }
+  .sd-community-lbl {
+    font-family:'Cinzel',serif; font-size:9px; font-weight:700; letter-spacing:.22em;
+    color:rgba(201,162,39,.4); text-transform:uppercase; text-align:center;
+    margin-bottom:6px;
+  }
+
+  .sd-players { display:flex; flex-direction:column; gap:0; }
+  .sd-player-row {
+    display:flex; flex-direction:column; align-items:center; gap:7px;
+    padding:14px 0;
+    border-bottom:1px solid rgba(255,255,255,.05);
+    transition:opacity .3s;
+  }
+  .sd-player-row:last-child { border-bottom:none; }
+  .sd-loser { opacity:.38; }
+
+  .sd-player-header { display:flex; align-items:center; gap:8px; }
+  .sd-trophy { font-size:16px; }
+  .sd-pname {
+    font-family:'Cinzel',serif; font-size:13px; font-weight:700;
+    letter-spacing:.12em; color:var(--text);
+  }
+  .sd-winner .sd-pname { color:var(--gold); }
+  .sd-won {
+    font-family:'Courier Prime',monospace; font-weight:700;
+    font-size:13px; color:#2ecc71;
+  }
+  .sd-cards { display:flex; gap:6px; }
+  .sd-rank {
+    font-family:'Cinzel',serif; font-size:10px; letter-spacing:.14em;
+    color:rgba(201,162,39,.55); text-transform:uppercase;
+  }
+  .sd-winner .sd-rank { color:var(--gold); font-weight:700; }
+
+  /* Fold / no-showdown case */
+  .sd-fold {
+    display:flex; flex-direction:column; align-items:center; gap:8px;
+    padding:12px 0;
+  }
+  .sd-fold-trophy { font-size:34px; margin-bottom:2px; }
+  .sd-fold-name {
+    font-family:'Cinzel',serif; font-size:16px; font-weight:700;
+    letter-spacing:.16em; color:var(--gold);
+  }
+  .sd-fold-chips {
+    font-family:'Courier Prime',monospace; font-size:20px;
+    font-weight:700; color:#2ecc71;
+  }
+  .sd-fold-note {
+    font-size:10px; letter-spacing:.1em; color:var(--text-dim); text-transform:uppercase;
+  }
+
+  /* ── STATUS BAR ──────────────────────────────────────── */
+  footer { border-top:1px solid rgba(201,162,39,.08); padding:7px 24px; display:flex; align-items:center; justify-content:space-between; background:rgba(4,10,5,.6); flex-shrink:0; }
+  .f-left { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text-dim); }
+  .conn-dot { width:6px; height:6px; border-radius:50%; background:#2ecc71; }
+  .conn-dot.off { background:#e74c3c; animation:livepulse 1s ease-in-out infinite; }
+  .f-right { font-size:11px; color:var(--text-dim); letter-spacing:.08em; }
+
+  /* ── WAITING STATE ───────────────────────────────────── */
+  .waiting-msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:20; pointer-events:none; }
+  .waiting-txt { font-family:'Cinzel',serif; font-size:16px; letter-spacing:.28em; color:rgba(201,162,39,.35); text-transform:uppercase; animation:wglow 2.4s ease-in-out infinite; }
+  @keyframes wglow { 0%,100%{opacity:.3} 50%{opacity:.7} }
 </style>
 </head>
 <body>
-<h1>🃏 AI Poker — Control Panel</h1>
 
-<div class="grid">
-  <!-- Left column -->
-  <div>
-    <div class="card" style="margin-bottom:16px">
-      <h2>Connected Players</h2>
-      <div id="online-list" class="online-list">
-        <span class="no-players">Waiting for connections…</span>
-      </div>
-      <div class="controls">
-        <button id="btn-start" onclick="startGame()">▶ Start Game</button>
-        <button id="btn-stop"  onclick="stopGame()">⏹ Stop</button>
-      </div>
-    </div>
+<!-- HEADER -->
+<header>
+  <div class="h-brand">AICollective <em>Poker</em></div>
+  <div class="h-center">
+    <div class="h-stat">Round <strong id="hRound">—</strong></div>
+    <div id="hStreet" class="h-pill">Waiting</div>
+    <div class="h-stat">Blinds <strong id="hBlinds">—/—</strong></div>
+  </div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <a href="/control" class="h-ctrl">⚙ Control</a>
+    <div class="live"><div class="live-dot"></div>LIVE</div>
+  </div>
+</header>
 
-    <div class="card">
-      <h2>Stacks</h2>
-      <div id="stacks-list"></div>
+<!-- MAIN -->
+<div class="main">
+
+  <!-- TABLE ZONE -->
+  <div class="table-zone">
+    <div class="arena" id="arena">
+      <div class="felt"></div>
+      <div class="table-center">
+        <div class="community" id="community"></div>
+        <div class="pot-wrap">
+          <div class="pot-chips" id="potChips"></div>
+          <span class="pot-lbl">Pot</span>
+          <span class="pot-val" id="potVal">0</span>
+        </div>
+      </div>
+      <div class="waiting-msg" id="waitMsg">
+        <div class="waiting-txt">Waiting for game to start</div>
+      </div>
     </div>
   </div>
 
-  <!-- Right column -->
-  <div>
-    <div class="card" style="margin-bottom:16px">
-      <h2>Game State</h2>
-      <span id="state-badge" class="state-badge state-waiting">waiting</span>
-      <div class="info-row">
-        <span class="info-label">Round</span>
-        <span class="info-value" id="round-num">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Street</span>
-        <span class="info-value" id="street">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Pot</span>
-        <span class="info-value" id="pot">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Blinds</span>
-        <span class="info-value" id="blinds">—</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">Action on</span>
-        <span class="info-value" id="current-player">—</span>
-      </div>
-      <div id="community" class="community"></div>
-      <div id="showdown-box" class="showdown-box" style="display:none"></div>
-    </div>
-
-    <div class="card">
-      <h2>Recent Events</h2>
-      <div id="events" class="events"></div>
-    </div>
+  <!-- LOG PANEL -->
+  <div class="log-panel">
+    <div class="log-head">● Table Feed</div>
+    <div class="log-feed" id="logFeed"></div>
   </div>
+
 </div>
 
-<div class="statusbar">
-  <span id="conn-status">⬤ connecting…</span>
-  <span id="last-update"></span>
+<!-- FOOTER -->
+<footer>
+  <div class="f-left">
+    <div class="conn-dot" id="connDot"></div>
+    <span id="connTxt">connecting…</span>
+  </div>
+  <div class="f-right" id="fRight">http://localhost:8765</div>
+</footer>
+
+<!-- SHOWDOWN OVERLAY -->
+<div class="showdown-overlay hidden" id="showdownOverlay">
+  <div class="showdown-card">
+    <div class="showdown-eyebrow">Round Complete</div>
+    <div id="showdownContent" class="showdown-content"></div>
+    <div class="showdown-bar-wrap">
+      <div class="showdown-bar" id="showdownBar"></div>
+    </div>
+  </div>
 </div>
 
 <script>
-const API = 'http://localhost:8765';
-let maxStack = 1000;
-let lastShowdown = null;
+const API  = 'http://localhost:8765/state';
+const TICK = 500;
 
-function suitClass(card) {
-  if (!card) return '';
-  const s = card.slice(-1);
-  return s === 'h' ? 'hearts' : s === 'd' ? 'diamonds' : s === 's' ? 'spades' : 'clubs';
+// ── Persistent state ─────────────────────────────────────
+let prevHash          = '';
+let seatMap           = {};      // playerId → seatIndex (never reassigned)
+let prevPlayerData    = {};      // playerId → JSON of last rendered data
+let prevCommunity     = [null,null,null,null,null];
+let prevLogJson       = '';
+let isOnline          = false;
+let showdownTimer     = null;
+let prevShowdownKey   = null;
+
+// ── Seat & chip positions ────────────────────────────────
+const SEAT_CSS = [
+  'bottom:2px; left:50%; transform:translateX(-50%)',
+  'top:18px; left:8%',
+  'top:18px; right:8%',
+  'top:50%; left:1%; transform:translateY(-50%)',
+  'top:50%; right:1%; transform:translateY(-50%)',
+];
+
+const BET_CHIP_CSS = [
+  'bottom:96px; left:50%; transform:translateX(-50%)',
+  'top:112px; left:22%',
+  'top:112px; right:22%',
+  'top:50%; left:22%; transform:translateY(-50%)',
+  'top:50%; right:22%; transform:translateY(-50%)',
+];
+
+// Dealer button positioned on the felt near each seat
+const DEALER_BTN_CSS = [
+  'bottom:100px; left:calc(50% + 52px)',
+  'top:114px; left:28%',
+  'top:114px; right:28%',
+  'top:calc(50% + 28px); left:20%',
+  'top:calc(50% + 28px); right:20%',
+];
+
+// ── Card parser ──────────────────────────────────────────
+function parseCard(s) {
+  if (!s || s.length < 2) return null;
+  const r = s[0].toUpperCase();
+  const su = s[1].toLowerCase();
+  return {
+    rank: r === 'T' ? '10' : r,
+    suit: {h:'♥',d:'♦',c:'♣',s:'♠'}[su] || su,
+    col:  (su === 'h' || su === 'd') ? 'red' : 'blk',
+  };
 }
 
-function renderCard(c) {
-  return `<span class="card-chip ${suitClass(c)}">${c}</span>`;
+function cardHTML(str, small = false, isNew = false) {
+  const c = parseCard(str);
+  if (!c) return `<div class="c-slot"></div>`;
+  const sz    = small ? ' sm' : '';
+  const anim  = isNew ? ' card-new' : '';
+  return `<div class="card ${c.col}${sz}${anim}">
+    <div class="card-r">${c.rank}</div>
+    <div class="card-s">${c.suit}</div>
+  </div>`;
 }
 
-function stateBadge(state, round) {
-  if (state === 'waiting') return ['state-waiting', 'waiting'];
-  if (state === 'showdown') return ['state-showdown', `showdown · r${round}`];
-  return ['state-playing', `playing · r${round}`];
-}
-
-function update(s) {
-  // Online players
-  const ol = document.getElementById('online-list');
-  const ws = s.ws_players || [];
-  ol.innerHTML = ws.length
-    ? ws.map(p => `<span class="online-chip">● ${p}</span>`).join('')
-    : '<span class="no-players">No players connected</span>';
-
-  // Buttons
-  const playing = s.game_state !== 'waiting';
-  document.getElementById('btn-start').disabled = playing || ws.length < 2;
-  document.getElementById('btn-stop').disabled  = !playing;
-
-  // State badge
-  const badge = document.getElementById('state-badge');
-  const [cls, label] = stateBadge(s.game_state, s.round_number);
-  badge.className = 'state-badge ' + cls;
-  badge.textContent = label;
-
-  // Info
-  document.getElementById('round-num').textContent = s.round_number || '—';
-  document.getElementById('street').textContent = s.street || '—';
-  document.getElementById('pot').textContent = s.pot ? s.pot + ' chips' : '—';
-  const b = s.blinds || {};
-  document.getElementById('blinds').textContent = b.sb ? `${b.sb}/${b.bb}` : '—';
-
-  // Current player
-  const players = s.players || [];
-  const cur = players.find(p => p.id === s.current_player);
-  document.getElementById('current-player').textContent = cur ? `@${cur.username}` : '—';
-
-  // Community cards
-  const comm = s.community_cards || [];
-  document.getElementById('community').innerHTML = comm.map(renderCard).join('');
-
-  // Stacks
-  if (players.length) {
-    maxStack = Math.max(...players.map(p => p.stack), maxStack);
-    document.getElementById('stacks-list').innerHTML = players.map(p => `
-      <div class="player-row">
-        <span class="player-name">@${p.username}</span>
-        <span class="player-stack">${p.stack}</span>
-      </div>
-      <div class="stack-bar"><div class="stack-fill" style="width:${Math.round(p.stack/maxStack*100)}%"></div></div>
-    `).join('');
+// ── Community cards ──────────────────────────────────────
+function renderCommunity(cards) {
+  const el = document.getElementById('community');
+  let changed = false;
+  let html = '';
+  for (let i = 0; i < 5; i++) {
+    const card = cards[i] || null;
+    const wasCard = prevCommunity[i];
+    const isNew = card && card !== wasCard;
+    const removed = !card && wasCard;
+    if (isNew || removed) { changed = true; prevCommunity[i] = card; }
+    html += card ? cardHTML(card, false, isNew) : `<div class="c-slot"></div>`;
   }
+  if (changed) el.innerHTML = html;
+}
 
-  // Showdown
-  const sd = s.showdown_result;
-  const sdBox = document.getElementById('showdown-box');
-  if (sd && sd.text && sd !== lastShowdown) {
-    lastShowdown = sd;
-    sdBox.style.display = 'block';
-    sdBox.textContent = sd.text;
-  } else if (s.game_state === 'playing') {
-    sdBox.style.display = 'none';
+// ── Pot ──────────────────────────────────────────────────
+function renderPot(pot) {
+  document.getElementById('potVal').textContent = pot.toLocaleString();
+  const colors = [];
+  if (pot >= 500) colors.push('#2471a3');
+  if (pot >= 200) colors.push('#27ae60');
+  if (pot >= 50)  colors.push('#c9a227');
+  if (pot > 0)    colors.push('#c0392b');
+  document.getElementById('potChips').innerHTML =
+    colors.slice(0,4).map(c => `<div class="chip-dot" style="background:${c}"></div>`).join('');
+}
+
+// ── Assign seat indices (permanent) ─────────────────────
+function assignSeats(players) {
+  players.forEach(p => {
+    if (!(p.id in seatMap)) {
+      const used = new Set(Object.values(seatMap));
+      let n = 0; while (used.has(n)) n++;
+      seatMap[p.id] = n;
+    }
+  });
+}
+
+// ── Players ──────────────────────────────────────────────
+function renderPlayers(players, currentId, sbId, bbId, btnPlayerId, lastActions) {
+  const arena = document.getElementById('arena');
+  assignSeats(players);
+
+  // Remove seats no longer in the list
+  const activeIds = new Set(players.map(p => p.id));
+  arena.querySelectorAll('.seat[data-pid]').forEach(el => {
+    if (!activeIds.has(Number(el.dataset.pid))) el.remove();
+  });
+
+  // Remove old dealer chip
+  arena.querySelectorAll('.dealer-btn-chip').forEach(el => el.remove());
+
+  players.forEach(p => {
+    const idx       = seatMap[p.id];
+    const isTurn    = p.id === currentId;
+    const isFolded  = p.status === 'folded';
+    const isAllin   = p.status === 'all_in';
+    const lastAct   = lastActions && lastActions[p.id] ? lastActions[p.id] : '';
+    const isSB      = p.id === sbId;
+    const isBB      = p.id === bbId;
+
+    // Cards: only animate if new
+    const cardsJson = JSON.stringify(p.hole_cards || []);
+    const prevJson  = prevPlayerData[p.id]?.cards || 'null';
+    const cardsNew  = cardsJson !== prevJson;
+    prevPlayerData[p.id] = { ...(prevPlayerData[p.id] || {}), cards: cardsJson };
+
+    let cardsHtml = '';
+    if (p.hole_cards && p.hole_cards.length > 0) {
+      cardsHtml = p.hole_cards.map(c => cardHTML(c, true, cardsNew)).join('');
+    } else {
+      cardsHtml = `<div class="card back sm"></div><div class="card back sm"></div>`;
+    }
+
+    const blindBadge   = isSB ? `<span class="p-blind sb">SB</span>` : isBB ? `<span class="p-blind bb">BB</span>` : '';
+    const statusLabel  = isAllin ? `<div class="p-status s-allin">All-In</div>` : isFolded ? `<div class="p-status s-folded">Folded</div>` : '';
+    const actionLabel  = lastAct ? `<div class="p-action">${lastAct}</div>` : '';
+    const betLabel     = (p.street_bet > 0 && !isFolded) ? `<div class="p-bet">bet ${p.street_bet}</div>` : '';
+
+    const seatId = `seat-p${p.id}`;
+    let seatEl = document.getElementById(seatId);
+
+    if (!seatEl) {
+      seatEl = document.createElement('div');
+      seatEl.id = seatId;
+      seatEl.dataset.pid = p.id;
+      seatEl.style.cssText = `position:absolute;${SEAT_CSS[idx % SEAT_CSS.length]}`;
+      arena.appendChild(seatEl);
+    }
+
+    seatEl.className = `seat${isTurn?' turn':''}${isFolded?' folded':''}${isAllin?' allin':''}`;
+
+    // Check if inner content changed before rewriting (avoids re-triggering animation)
+    const inner = `${isTurn}|${isFolded}|${isAllin}|${cardsJson}|${p.stack}|${p.street_bet}|${lastAct}|${isSB}|${isBB}`;
+    if (prevPlayerData[p.id]?.inner !== inner) {
+      prevPlayerData[p.id].inner = inner;
+      seatEl.innerHTML = `
+        <div class="turn-badge">● Acting</div>
+        <div class="pod">
+          <div class="pod-top">${blindBadge}<div class="p-name">${p.username}</div></div>
+          <div class="p-cards">${cardsHtml}</div>
+          <div class="p-stack">${p.stack.toLocaleString()}</div>
+          ${betLabel}${statusLabel}${actionLabel}
+        </div>`;
+    }
+
+    // Bet chip on table
+    const betId = `betc-${p.id}`;
+    let betChip = document.getElementById(betId);
+    if (p.street_bet > 0 && p.status !== 'folded') {
+      if (!betChip) {
+        betChip = document.createElement('div');
+        betChip.id = betId;
+        betChip.className = 'bet-chip';
+        betChip.style.cssText = BET_CHIP_CSS[idx % BET_CHIP_CSS.length];
+        arena.appendChild(betChip);
+      }
+      betChip.textContent = p.street_bet;
+    } else if (betChip) betChip.remove();
+  });
+
+  // Dealer button: use btn_player_id from server (fixed for the whole round)
+  if (btnPlayerId !== null && seatMap[btnPlayerId] !== undefined) {
+    const dchip = document.createElement('div');
+    dchip.className = 'dealer-btn-chip';
+    dchip.textContent = 'D';
+    dchip.style.cssText = DEALER_BTN_CSS[seatMap[btnPlayerId] % DEALER_BTN_CSS.length];
+    arena.appendChild(dchip);
   }
+}
 
-  // Events
-  const evts = (s.recent_events || []).slice().reverse();
-  document.getElementById('events').innerHTML = evts.map(e => {
-    const clean = e.replace('[DEALER] ', '');
-    return `<div class="event-line">${clean}</div>`;
+// ── Log feed ─────────────────────────────────────────────
+function renderLog(events, players) {
+  const logJson = JSON.stringify(events);
+  if (logJson === prevLogJson) return;
+  prevLogJson = logJson;
+
+  const feed = document.getElementById('logFeed');
+  const reversed = (events || []).slice().reverse();
+  const html = reversed.map((ev, i) => {
+    let txt = ev.replace('[DEALER]', '').trim();
+    (players || []).forEach(p => {
+      txt = txt.replace(new RegExp(`\\b${p.username}\\b`, 'gi'),
+        `<span class="log-who">${p.username}</span>`);
+    });
+    return `<div class="log-item${i === 0 ? ' fresh' : ''}">${txt}</div>`;
   }).join('');
-
-  // Status bar
-  document.getElementById('conn-status').textContent = '⬤ live';
-  document.getElementById('conn-status').style.color = '#3fb950';
-  document.getElementById('last-update').textContent =
-    'updated ' + new Date().toLocaleTimeString();
+  feed.innerHTML = html;
 }
 
-async function fetchState() {
+// ── Showdown overlay ─────────────────────────────────────
+function renderShowdown(result) {
+  const overlay = document.getElementById('showdownOverlay');
+
+  if (!result) {
+    overlay.classList.add('hidden');
+    if (showdownTimer) { clearTimeout(showdownTimer); showdownTimer = null; }
+    prevShowdownKey = null;
+    return;
+  }
+
+  const key = result.timestamp || result.text || result;
+  if (key === prevShowdownKey) return;
+  prevShowdownKey = key;
+
+  const content = document.getElementById('showdownContent');
+  const isRich = result.reason && result.players_map;
+
+  if (isRich) {
+    // Determine winner ids
+    const winnerIds = new Set();
+    if (result.reason === 'fold' && result.winner_id != null) {
+      winnerIds.add(String(result.winner_id));
+    } else if (result.total_won) {
+      Object.keys(result.total_won).forEach(id => winnerIds.add(id));
+    }
+
+    let html = '';
+
+    // Community cards
+    if (result.community && result.community.length > 0) {
+      html += `<div class="sd-community-lbl">Board</div>`;
+      html += `<div class="sd-community">`;
+      result.community.forEach(c => { html += cardHTML(c, false, false); });
+      html += `</div>`;
+    }
+
+    const hands = result.hands || [];
+    const isFoldOrNoCards = result.reason === 'fold' || result.reason === 'last_standing' || hands.length === 0;
+
+    if (isFoldOrNoCards) {
+      const wid = result.winner_id ? String(result.winner_id) : [...winnerIds][0];
+      const wname = result.players_map?.[wid] || `Player ${wid}`;
+      const won = result.total_won?.[wid] || result.pots?.[0]?.amount || 0;
+      html += `<div class="sd-fold">
+        <div class="sd-fold-trophy">🏆</div>
+        <div class="sd-fold-name">@${wname}</div>
+        <div class="sd-fold-chips">+${won} chips</div>
+        <div class="sd-fold-note">opponent folded</div>
+      </div>`;
+    } else {
+      // Sort winners first
+      const sorted = [...hands].sort((a, b) => {
+        const aw = winnerIds.has(String(a.player_id)) ? 0 : 1;
+        const bw = winnerIds.has(String(b.player_id)) ? 0 : 1;
+        return aw - bw;
+      });
+
+      html += `<div class="sd-players">`;
+      sorted.forEach(h => {
+        const pid = String(h.player_id);
+        const uname = result.players_map?.[pid] || `Player ${pid}`;
+        const isWinner = winnerIds.has(pid);
+        const won = result.total_won?.[pid] || 0;
+
+        html += `<div class="sd-player-row ${isWinner ? 'sd-winner' : 'sd-loser'}">`;
+        html += `<div class="sd-player-header">`;
+        if (isWinner) html += `<span class="sd-trophy">🏆</span>`;
+        html += `<span class="sd-pname">@${uname}</span>`;
+        if (isWinner && won) html += `<span class="sd-won">+${won}</span>`;
+        html += `</div>`;
+        if (h.hole_cards && h.hole_cards.length > 0) {
+          html += `<div class="sd-cards">`;
+          h.hole_cards.forEach(c => { html += cardHTML(c, false, false); });
+          html += `</div>`;
+        }
+        if (h.rank) html += `<div class="sd-rank">${h.rank}</div>`;
+        html += `</div>`;
+      });
+      html += `</div>`;
+    }
+
+    content.innerHTML = html;
+  } else {
+    content.textContent = (typeof result === 'object' ? result.text : result) || '';
+  }
+
+  // Show overlay
+  overlay.classList.remove('hidden');
+
+  // Drain bar
+  const bar = document.getElementById('showdownBar');
+  bar.className = 'showdown-bar';
+  bar.style.width = '100%';
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    bar.className = 'showdown-bar draining';
+  }));
+
+  if (showdownTimer) clearTimeout(showdownTimer);
+  showdownTimer = setTimeout(() => overlay.classList.add('hidden'), 10000);
+}
+
+// ── State hash for change detection ─────────────────────
+function hashState(s) {
+  if (!s) return '';
+  return JSON.stringify({
+    ts:      s.timestamp,
+    pot:     s.pot,
+    comm:    s.community_cards,
+    cur:     s.current_player,
+    street:  s.street,
+    round:   s.round_number,
+    acts:    s.last_actions,
+    btn:     s.btn_player_id,
+    sd:      s.showdown_result?.timestamp,
+    players: (s.players || []).map(p => `${p.id}:${p.stack}:${p.street_bet}:${p.status}:${p.is_current_turn}:${(p.hole_cards||[]).join(',')}`),
+  });
+}
+
+// ── Main update ──────────────────────────────────────────
+function update(state) {
+  const hash = hashState(state);
+  if (hash === prevHash) return;
+  prevHash = hash;
+
+  const waiting = !state || state.game_state === 'waiting';
+
+  document.getElementById('hRound').textContent  = state?.round_number || '—';
+  document.getElementById('hStreet').textContent = (state?.street || 'waiting').toUpperCase();
+  document.getElementById('hBlinds').textContent = state?.blinds
+    ? `${state.blinds.sb}/${state.blinds.bb}` : '—/—';
+
+  document.getElementById('waitMsg').style.display = waiting ? 'flex' : 'none';
+
+  renderCommunity(state?.community_cards || []);
+  renderPot(state?.pot || 0);
+  renderPlayers(
+    state?.players || [],
+    state?.current_player ?? null,
+    state?.sb_player_id ?? null,
+    state?.bb_player_id ?? null,
+    state?.btn_player_id ?? null,
+    state?.last_actions || {}
+  );
+  renderLog(state?.recent_events || [], state?.players);
+  renderShowdown(state?.showdown_result || null);
+}
+
+// ── Polling ──────────────────────────────────────────────
+async function poll() {
   try {
-    const r = await fetch(`${API}/state`);
-    if (r.ok) update(await r.json());
+    const r = await fetch(API, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const state = await r.json();
+    update(state);
+
+    if (!isOnline) {
+      isOnline = true;
+      document.getElementById('connDot').className = 'conn-dot';
+      document.getElementById('connTxt').textContent = 'connected — live';
+    }
   } catch {
-    document.getElementById('conn-status').textContent = '⬤ disconnected';
-    document.getElementById('conn-status').style.color = '#f85149';
+    if (isOnline) {
+      isOnline = false;
+      document.getElementById('connDot').className = 'conn-dot off';
+      document.getElementById('connTxt').textContent = 'dealer offline';
+    }
   }
 }
 
-async function startGame() {
-  document.getElementById('btn-start').disabled = true;
-  try {
-    const r = await fetch(`${API}/startgame`, { method: 'POST' });
-    const d = await r.json();
-    if (!d.ok) alert('Cannot start: ' + d.error);
-  } catch(e) { alert('Error: ' + e); }
-}
-
-async function stopGame() {
-  if (!confirm('Stop the tournament?')) return;
-  try {
-    await fetch(`${API}/stopgame`, { method: 'POST' });
-  } catch(e) { alert('Error: ' + e); }
-}
-
-fetchState();
-setInterval(fetchState, 2000);
+poll();
+setInterval(poll, TICK);
 </script>
 </body>
 </html>

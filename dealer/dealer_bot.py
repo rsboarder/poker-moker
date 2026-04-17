@@ -50,6 +50,7 @@ load_dotenv()
 
 SPECTATOR_PORT = int(os.getenv("SPECTATOR_PORT", "8765"))
 _SPECTATOR_HTML = pathlib.Path(__file__).parent.parent / "spectator.html"
+_CONTROL_HTML   = pathlib.Path(__file__).parent.parent / "control.html"
 
 _spectator_state: dict = {
     "game_state": "waiting",
@@ -68,6 +69,8 @@ _spectator_state: dict = {
     "recent_events": [],
     "timestamp": 0,
     "ws_players": [],
+    "tg_configured": False,  # set after config load
+    "tg_logging": False,     # toggled from control panel
 }
 _spectator_lock = threading.Lock()
 
@@ -117,6 +120,15 @@ class _SpectatorHandler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
+        elif self.path == "/tg-toggle":
+            with _spectator_lock:
+                if not _spectator_state["tg_configured"]:
+                    self._send_json(400, {"error": "Telegram not configured"})
+                    return
+                _spectator_state["tg_logging"] = not _spectator_state["tg_logging"]
+                new_val = _spectator_state["tg_logging"]
+            log.info("Telegram logging %s via HTTP", "enabled" if new_val else "disabled")
+            self._send_json(200, {"ok": True, "tg_logging": new_val})
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -125,17 +137,22 @@ class _SpectatorHandler(BaseHTTPRequestHandler):
             with _spectator_lock:
                 self._send_json(200, _spectator_state)
         elif self.path in ("/", "/index.html"):
-            if _SPECTATOR_HTML.exists():
-                body = _SPECTATOR_HTML.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_error(404, "spectator.html not found")
+            self._serve_html(_SPECTATOR_HTML)
+        elif self.path in ("/control", "/control.html"):
+            self._serve_html(_CONTROL_HTML)
         else:
             self.send_error(404)
+
+    def _serve_html(self, path: pathlib.Path):
+        if path.exists():
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404, f"{path.name} not found")
 
 
 def _start_spectator_server():
@@ -180,8 +197,9 @@ log = logging.getLogger("dealer")
 # Config
 # ---------------------------------------------------------------------------
 
-DEALER_BOT_TOKEN   = os.environ["DEALER_BOT_TOKEN"]
-MAIN_GROUP_ID      = int(os.environ["MAIN_GROUP_ID"])
+DEALER_BOT_TOKEN   = os.getenv("DEALER_BOT_TOKEN", "")
+MAIN_GROUP_ID      = int(os.getenv("MAIN_GROUP_ID", "0"))
+TG_CONFIGURED      = bool(DEALER_BOT_TOKEN and MAIN_GROUP_ID)
 ACTION_TIMEOUT     = float(os.getenv("ACTION_TIMEOUT_SECONDS", "5"))
 STARTING_STACK     = int(os.getenv("STARTING_STACK", "1000"))
 WS_PORT            = int(os.getenv("WS_PORT", "9000"))
@@ -539,14 +557,17 @@ class TableSession:
                 pass
 
         # Telegram fallback
-        text = f"@{agent.username} Round #{round_num}: {cards[0]} {cards[1]}"
-        if agent.ready_message_id:
-            await self.bot.send_message(
-                agent.private_group_id, text,
-                reply_to_message_id=agent.ready_message_id,
-            )
-        else:
-            await self.bot.send_message(agent.private_group_id, text)
+        with _spectator_lock:
+            tg_on = self.bot and _spectator_state.get("tg_logging", False)
+        if tg_on:
+            text = f"@{agent.username} Round #{round_num}: {cards[0]} {cards[1]}"
+            if agent.ready_message_id:
+                await self.bot.send_message(
+                    agent.private_group_id, text,
+                    reply_to_message_id=agent.ready_message_id,
+                )
+            else:
+                await self.bot.send_message(agent.private_group_id, text)
 
     async def _send_action_request(self, agent: AgentInfo, prompt_text: str):
         self._action_event.clear()
@@ -635,12 +656,15 @@ class TableSession:
                 pass
 
         # Telegram fallback
-        await asyncio.sleep(0.5)
-        msg = await self.bot.send_message(
-            MAIN_GROUP_ID,
-            f"/turn@{agent.username}\n{prompt_text}",
-        )
-        self._pending_message_id = msg.message_id
+        with _spectator_lock:
+            tg_on = self.bot and _spectator_state.get("tg_logging", False)
+        if tg_on:
+            await asyncio.sleep(0.5)
+            msg = await self.bot.send_message(
+                MAIN_GROUP_ID,
+                f"/turn@{agent.username}\n{prompt_text}",
+            )
+            self._pending_message_id = msg.message_id
 
     async def _wait_for_action(self) -> tuple[str, int]:
         try:
@@ -1027,7 +1051,18 @@ class DealerBot:
             log.info("=== TOURNAMENT STOPPED via HTTP ===")
         if self.table:
             self.table.stop()
-            self.table.engine.state = GameState.WAITING
+        self.table = None
+        self._round_task = None
+        with _spectator_lock:
+            _spectator_state["game_state"] = "waiting"
+            _spectator_state["street"] = "waiting"
+            _spectator_state["pot"] = 0
+            _spectator_state["community_cards"] = []
+            _spectator_state["players"] = []
+            _spectator_state["current_player"] = None
+            _spectator_state["showdown_result"] = None
+            _spectator_state["last_actions"] = {}
+            _spectator_state["timestamp"] = int(time.time())
         return {"ok": True}
 
     async def cmd_newtournament(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1314,8 +1349,14 @@ class DealerBot:
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _send(bot: Bot, chat_id: int, text: str, **kwargs) -> None:
-    """Send a message with automatic RetryAfter / network-timeout handling."""
+async def _send(bot: "Bot | None", chat_id: int, text: str, **kwargs) -> None:
+    """Send a message to TG. No-op if TG logging is disabled or bot is None."""
+    if bot is None:
+        return
+    with _spectator_lock:
+        enabled = _spectator_state.get("tg_logging", False)
+    if not enabled:
+        return
     attempts = 0
     while True:
         try:
@@ -1393,9 +1434,12 @@ def _build_app(dealer: DealerBot) -> Application:
 
 
 async def async_main():
-    """Async entry point — controls the event loop explicitly so we can
-    add a WebSocket server alongside Telegram polling later.
-    """
+    """Async entry point — controls the event loop explicitly."""
+    # Update spectator state with TG availability
+    with _spectator_lock:
+        _spectator_state["tg_configured"] = TG_CONFIGURED
+        _spectator_state["tg_logging"]    = TG_CONFIGURED  # on by default if configured
+
     agents = load_agents()
     if not agents:
         log.warning("No pre-configured agents. Waiting for WS connections before /startgame.")
@@ -1403,7 +1447,6 @@ async def async_main():
         log.info("Loaded %d agent(s): %s", len(agents), [a.username for a in agents])
 
     dealer = DealerBot(agents)
-    app = _build_app(dealer)
 
     global _dealer_ref, _loop_ref
     _dealer_ref = dealer
@@ -1411,11 +1454,15 @@ async def async_main():
 
     _start_spectator_server()
 
-    # --- Start Telegram polling (non-blocking) ---
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    log.info("Dealer bot started. Main group: %d", MAIN_GROUP_ID)
+    app = None
+    if TG_CONFIGURED:
+        app = _build_app(dealer)
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        log.info("Dealer bot started. Main group: %d", MAIN_GROUP_ID)
+    else:
+        log.warning("Telegram not configured — running in WebSocket-only mode (no TG bot).")
 
     # --- WebSocket server ---
     ws_server = await websockets.serve(dealer.ws_handler, "0.0.0.0", WS_PORT)
@@ -1433,9 +1480,10 @@ async def async_main():
         log.info("Shutting down...")
         ws_server.close()
         await ws_server.wait_closed()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        if app:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
 
 
 def main():

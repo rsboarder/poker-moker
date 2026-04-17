@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Poker — Control Panel</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0d1117;
+    color: #e6edf3;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 14px;
+    padding: 20px;
+  }
+  h1 { font-size: 18px; color: #f0c040; margin-bottom: 16px; letter-spacing: 1px; }
+  .grid { display: grid; grid-template-columns: 280px 1fr; gap: 16px; }
+  .card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h2 { font-size: 11px; text-transform: uppercase; color: #8b949e; letter-spacing: 1px; margin-bottom: 12px; }
+  .status-dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; margin-right: 6px;
+  }
+  .dot-green { background: #3fb950; }
+  .dot-yellow { background: #d29922; }
+  .dot-red { background: #f85149; }
+  .dot-gray { background: #484f58; }
+
+  .player-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 0; border-bottom: 1px solid #21262d;
+  }
+  .player-row:last-child { border-bottom: none; }
+  .player-name { color: #58a6ff; }
+  .player-stack { color: #3fb950; font-weight: bold; }
+  .stack-bar {
+    height: 4px; background: #21262d; border-radius: 2px;
+    margin-top: 4px; overflow: hidden;
+  }
+  .stack-fill { height: 100%; background: #3fb950; border-radius: 2px; transition: width 0.4s; }
+
+  .state-badge {
+    display: inline-block; padding: 2px 10px; border-radius: 12px;
+    font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;
+    margin-bottom: 10px;
+  }
+  .state-waiting { background: #21262d; color: #8b949e; }
+  .state-playing { background: #0d2f0d; color: #3fb950; }
+  .state-showdown { background: #2f1b0d; color: #f0c040; }
+
+  .info-row { display: flex; justify-content: space-between; padding: 4px 0; }
+  .info-label { color: #8b949e; }
+  .info-value { color: #e6edf3; }
+
+  .community { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .card-chip {
+    background: #21262d; border: 1px solid #30363d;
+    border-radius: 4px; padding: 4px 8px;
+    font-size: 13px; font-weight: bold;
+  }
+  .card-chip.hearts, .card-chip.diamonds { color: #f85149; }
+  .card-chip.spades, .card-chip.clubs { color: #e6edf3; }
+
+  .controls { display: flex; gap: 10px; margin-top: 14px; }
+  button {
+    flex: 1; padding: 10px; border: none; border-radius: 6px;
+    font-family: inherit; font-size: 13px; font-weight: bold;
+    cursor: pointer; transition: opacity 0.15s;
+  }
+  button:hover { opacity: 0.85; }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  #btn-start { background: #238636; color: #fff; }
+  #btn-stop  { background: #da3633; color: #fff; }
+  .tg-row { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding-top: 10px; border-top: 1px solid #21262d; }
+  .tg-label { color: #8b949e; font-size: 12px; }
+  .tg-badge { font-size: 11px; font-weight: bold; padding: 2px 8px; border-radius: 10px; }
+  .tg-on  { background: #0d2f0d; color: #3fb950; border: 1px solid #3fb950; }
+  .tg-off { background: #21262d; color: #484f58; border: 1px solid #30363d; }
+  #btn-tg { flex: none; padding: 6px 14px; font-size: 12px; background: #21262d; color: #8b949e; border: 1px solid #30363d; }
+  #btn-tg.active { background: #0d2f0d; color: #3fb950; border-color: #3fb950; }
+
+  .events {
+    height: 220px; overflow-y: auto;
+    font-size: 12px; line-height: 1.6;
+  }
+  .events::-webkit-scrollbar { width: 4px; }
+  .events::-webkit-scrollbar-track { background: #161b22; }
+  .events::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+  .event-line { padding: 2px 0; border-bottom: 1px solid #21262d; color: #8b949e; }
+  .event-line:last-child { border-bottom: none; }
+
+  .showdown-box {
+    margin-top: 12px; padding: 10px;
+    background: #1a1a0a; border: 1px solid #f0c040;
+    border-radius: 6px; font-size: 12px; line-height: 1.7;
+    white-space: pre-wrap;
+  }
+
+  .statusbar {
+    margin-top: 14px; font-size: 11px; color: #484f58;
+    display: flex; justify-content: space-between;
+  }
+
+  .online-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .online-chip {
+    background: #0d2f0d; border: 1px solid #3fb950;
+    color: #3fb950; border-radius: 12px; padding: 2px 10px; font-size: 12px;
+  }
+  .no-players { color: #484f58; font-size: 12px; }
+  .spectator-link { font-size: 12px; color: #58a6ff; text-decoration: none; margin-left: 8px; }
+</style>
+</head>
+<body>
+<h1>🃏 AI Poker — Control Panel <a class="spectator-link" href="/">🎴 Spectator View</a></h1>
+
+<div class="grid">
+  <div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>Connected Players</h2>
+      <div id="online-list" class="online-list">
+        <span class="no-players">Waiting for connections…</span>
+      </div>
+      <div class="controls">
+        <button id="btn-start" onclick="startGame()">▶ Start Game</button>
+        <button id="btn-stop"  onclick="stopGame()">⏹ Stop</button>
+      </div>
+      <div class="tg-row" id="tg-row" style="display:none">
+        <span class="tg-label">Telegram logging</span>
+        <button id="btn-tg" onclick="toggleTg()">TG OFF</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Stacks</h2>
+      <div id="stacks-list"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>Game State</h2>
+      <span id="state-badge" class="state-badge state-waiting">waiting</span>
+      <div class="info-row">
+        <span class="info-label">Round</span>
+        <span class="info-value" id="round-num">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Street</span>
+        <span class="info-value" id="street">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Pot</span>
+        <span class="info-value" id="pot">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Blinds</span>
+        <span class="info-value" id="blinds">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Action on</span>
+        <span class="info-value" id="current-player">—</span>
+      </div>
+      <div id="community" class="community"></div>
+      <div id="showdown-box" class="showdown-box" style="display:none"></div>
+    </div>
+
+    <div class="card">
+      <h2>Recent Events</h2>
+      <div id="events" class="events"></div>
+    </div>
+  </div>
+</div>
+
+<div class="statusbar">
+  <span id="conn-status">⬤ connecting…</span>
+  <span id="last-update"></span>
+</div>
+
+<script>
+const API = 'http://localhost:8765';
+let maxStack = 1000;
+let lastShowdown = null;
+
+function suitClass(card) {
+  if (!card) return '';
+  const s = card.slice(-1);
+  return s === 'h' ? 'hearts' : s === 'd' ? 'diamonds' : s === 's' ? 'spades' : 'clubs';
+}
+
+function renderCard(c) {
+  return `<span class="card-chip ${suitClass(c)}">${c}</span>`;
+}
+
+function stateBadge(state, round) {
+  if (state === 'waiting') return ['state-waiting', 'waiting'];
+  if (state === 'showdown') return ['state-showdown', `showdown · r${round}`];
+  return ['state-playing', `playing · r${round}`];
+}
+
+function update(s) {
+  const ol = document.getElementById('online-list');
+  const ws = s.ws_players || [];
+  ol.innerHTML = ws.length
+    ? ws.map(p => `<span class="online-chip">● ${p}</span>`).join('')
+    : '<span class="no-players">No players connected</span>';
+
+  const playing = s.game_state !== 'waiting';
+  document.getElementById('btn-start').disabled = playing || ws.length < 2;
+  document.getElementById('btn-stop').disabled  = !playing;
+
+  const badge = document.getElementById('state-badge');
+  const [cls, label] = stateBadge(s.game_state, s.round_number);
+  badge.className = 'state-badge ' + cls;
+  badge.textContent = label;
+
+  document.getElementById('round-num').textContent = s.round_number || '—';
+  document.getElementById('street').textContent = s.street || '—';
+  document.getElementById('pot').textContent = s.pot ? s.pot + ' chips' : '—';
+  const b = s.blinds || {};
+  document.getElementById('blinds').textContent = b.sb ? `${b.sb}/${b.bb}` : '—';
+
+  const players = s.players || [];
+  const cur = players.find(p => p.id === s.current_player);
+  document.getElementById('current-player').textContent = cur ? `@${cur.username}` : '—';
+
+  const comm = s.community_cards || [];
+  document.getElementById('community').innerHTML = comm.map(renderCard).join('');
+
+  if (players.length) {
+    maxStack = Math.max(...players.map(p => p.stack), maxStack);
+    document.getElementById('stacks-list').innerHTML = players.map(p => `
+      <div class="player-row">
+        <span class="player-name">@${p.username}</span>
+        <span class="player-stack">${p.stack}</span>
+      </div>
+      <div class="stack-bar"><div class="stack-fill" style="width:${Math.round(p.stack/maxStack*100)}%"></div></div>
+    `).join('');
+  }
+
+  const sd = s.showdown_result;
+  const sdBox = document.getElementById('showdown-box');
+  if (sd && sd.text && sd !== lastShowdown) {
+    lastShowdown = sd;
+    sdBox.style.display = 'block';
+    sdBox.textContent = sd.text;
+  } else if (s.game_state === 'playing') {
+    sdBox.style.display = 'none';
+  }
+
+  const evts = (s.recent_events || []).slice().reverse();
+  document.getElementById('events').innerHTML = evts.map(e => {
+    const clean = e.replace('[DEALER] ', '');
+    return `<div class="event-line">${clean}</div>`;
+  }).join('');
+
+  document.getElementById('conn-status').textContent = '⬤ live';
+  document.getElementById('conn-status').style.color = '#3fb950';
+  document.getElementById('last-update').textContent =
+    'updated ' + new Date().toLocaleTimeString();
+
+  // TG toggle row
+  const tgRow = document.getElementById('tg-row');
+  const btnTg = document.getElementById('btn-tg');
+  if (s.tg_configured) {
+    tgRow.style.display = 'flex';
+    const on = s.tg_logging;
+    btnTg.textContent = on ? 'TG ON' : 'TG OFF';
+    btnTg.className = on ? 'active' : '';
+    btnTg.disabled = false;
+  } else {
+    tgRow.style.display = 'none';
+  }
+}
+
+async function fetchState() {
+  try {
+    const r = await fetch(`${API}/state`);
+    if (r.ok) update(await r.json());
+  } catch {
+    document.getElementById('conn-status').textContent = '⬤ disconnected';
+    document.getElementById('conn-status').style.color = '#f85149';
+  }
+}
+
+async function startGame() {
+  document.getElementById('btn-start').disabled = true;
+  try {
+    const r = await fetch(`${API}/startgame`, { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) alert('Cannot start: ' + d.error);
+  } catch(e) { alert('Error: ' + e); }
+}
+
+async function stopGame() {
+  if (!confirm('Stop the tournament?')) return;
+  try {
+    await fetch(`${API}/stopgame`, { method: 'POST' });
+  } catch(e) { alert('Error: ' + e); }
+}
+
+async function toggleTg() {
+  try {
+    const r = await fetch(`${API}/tg-toggle`, { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) alert('TG toggle failed: ' + (d.error || '?'));
+  } catch(e) { alert('Error: ' + e); }
+}
+
+fetchState();
+setInterval(fetchState, 2000);
+</script>
+</body>
+</html>
