@@ -516,6 +516,7 @@ class TableSession:
                     "hands": ev.data.get("hands", []),
                     "reason": ev.data.get("reason"),
                 })
+                await self._send_showdown(ev)  # sets rich showdown_result for spectator overlay
                 self._update_spectator()
 
             await asyncio.sleep(0.3)
