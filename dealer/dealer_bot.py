@@ -1056,7 +1056,13 @@ class DealerBot:
                 msg_type = msg.get("type")
 
                 if msg_type == "register":
-                    username = await self._ws_register(ws, msg)
+                    # On failed register (duplicate, bad invite), _ws_register
+                    # returns None. Keep the previous `username` so the finally
+                    # block still cleans up — otherwise the duplicate's close
+                    # would leak a stale ws in ws_connections indefinitely.
+                    registered = await self._ws_register(ws, msg)
+                    if registered:
+                        username = registered
 
                 elif msg_type == "action":
                     await self._ws_action(ws, username, msg)
@@ -1144,6 +1150,14 @@ class DealerBot:
         if not username:
             await ws.send(json.dumps({"type": "error", "text": "not registered"}))
             return
+        # Socket ownership: reject if this socket isn't the current mapping for
+        # `username`. Prevents a stale/hijacked socket from acting after reconnect.
+        if self.ws_connections.get(username) is not ws:
+            await ws.send(json.dumps({
+                "type": "error",
+                "text": "stale socket — re-register to act",
+            }))
+            return
         if not self.tables:
             await ws.send(json.dumps({"type": "error", "text": "no active game"}))
             return
@@ -1169,12 +1183,22 @@ class DealerBot:
             await ws.send(json.dumps({"type": "error", "text": "you are not seated at any table"}))
             return
 
-        # Enforce turn_id (stale replies rejected). None means legacy client without turn_id.
-        msg_turn_id = msg.get("turn_id")
+        # Mandatory turn_id: reject missing / non-integer outright.
+        raw_turn_id = msg.get("turn_id")
+        if raw_turn_id is None:
+            await ws.send(json.dumps({
+                "type": "error",
+                "text": "missing turn_id (every action MUST echo the turn's turn_id)",
+            }))
+            return
         try:
-            msg_turn_id = int(msg_turn_id) if msg_turn_id is not None else None
+            msg_turn_id = int(raw_turn_id)
         except (ValueError, TypeError):
-            msg_turn_id = None
+            await ws.send(json.dumps({
+                "type": "error",
+                "text": f"invalid turn_id: {raw_turn_id!r} (must be integer)",
+            }))
+            return
 
         accepted = target_table.accept_action(username, action, amount, turn_id=msg_turn_id)
         if not accepted:
@@ -1280,12 +1304,13 @@ class DealerBot:
             t.stop()
             t.engine.state = GameState.WAITING
 
-        # Await cancellations so old tasks fully unwind before we clear state
+        # Await cancellations so old tasks fully unwind before we clear state.
+        # Log any teardown exceptions (CancelledError is expected; others are bugs).
         if to_await:
-            try:
-                await asyncio.gather(*to_await, return_exceptions=True)
-            except Exception:
-                pass
+            results = await asyncio.gather(*to_await, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                    log.warning("Teardown exception during _stop_all_tables: %r", r)
 
         self._table_tasks.clear()
         if self._tournament_task is not current:
@@ -1666,6 +1691,18 @@ class DealerBot:
                     list(self._table_tasks.values()),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                # Detect crashed tables FIRST — integrity critical. A crashed
+                # table task must not be treated as a clean exit, or the
+                # coordinator could crown a false winner.
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc is not None:
+                        log.error("Table task crashed with %s — aborting tournament",
+                                  type(exc).__name__)
+                        raise exc
+
                 # Remove completed tasks from dict
                 for task in done:
                     finished_tid = next(
@@ -1715,19 +1752,33 @@ class DealerBot:
             except Exception:
                 pass
         finally:
-            # ALWAYS drop to IDLE regardless of prior state — otherwise a coordinator
-            # exception leaves us stuck in RUNNING and /startgame is permanently locked.
-            # Cancel any still-running table tasks so they don't emit stray events.
+            # Full reset on ANY exit path (clean completion, cancel, crash).
+            # Mirrors trigger_stopgame — prevents stale self.tables /
+            # _tournament_agents / spectator_state from leaking into next tournament.
             for task in list(self._table_tasks.values()):
                 if not task.done():
                     task.cancel()
             if self._table_tasks:
-                try:
-                    await asyncio.gather(*self._table_tasks.values(), return_exceptions=True)
-                except Exception:
-                    pass
+                results = await asyncio.gather(
+                    *self._table_tasks.values(), return_exceptions=True
+                )
+                for r in results:
+                    if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                        log.error("Residual table task raised during shutdown: %r", r)
                 self._table_tasks.clear()
+
+            # Clear only state that would interfere with a restart. Keep diagnostic
+            # state (_eliminated_announced, _tournament_agents) for post-tournament
+            # inspection by tests / the next /status query — it's cleared on the
+            # next /startgame via _seat_and_init_tables, and on /stopgame via
+            # _reset_tournament_state.
+            self.tables.clear()
             self._tournament_state = TournamentState.IDLE
+            with _spectator_lock:
+                _spectator_state["table_count"] = 0
+                # Keep `tables`, `winner`, `game_state` as set by the success path
+                # so spectators see the final "tournament_over" snapshot. These get
+                # cleared by the next /startgame or /stopgame.
 
     async def _run_table_loop(self, table_id: int):
         """Run rounds at one table until ≤1 player remains at that table OR
@@ -1752,14 +1803,14 @@ class DealerBot:
                     log.info("[T%d] table exiting — %d active player(s)", table_id, len(active))
                     break
 
-                # Blind level = max round played across ALL active tables (shared clock).
-                # Per-table increment was causing N× faster escalation with N parallel tables.
+                # Shared blind clock across all tables. Monotonic: we only ever
+                # increase it, so breaking the fastest table doesn't regress blinds.
                 table_round = table.engine.round_number + 1  # about to play this round
-                max_round = max(
+                live_max = max(
                     [t.engine.round_number for t in self.tables.values()] + [table_round]
                 )
-                self._global_round_count = max_round
-                new_sb, new_bb = get_blinds(max_round)
+                self._global_round_count = max(self._global_round_count, live_max)
+                new_sb, new_bb = get_blinds(self._global_round_count)
                 if (new_sb, new_bb) != (table.engine.small_blind, table.engine.big_blind):
                     table.engine.set_blinds(new_sb, new_bb)
 
@@ -1785,7 +1836,11 @@ class DealerBot:
             log.info("[T%d] table task cancelled", table_id)
             raise
         except Exception as e:
+            # A table crash is integrity-critical — coordinator must NOT treat
+            # this as a clean exit and crown a false winner. Re-raise so the
+            # coordinator's exception handler aborts the tournament cleanly.
             log.error("[T%d] table crashed: %s", table_id, e, exc_info=True)
+            raise
 
     async def _handle_table_breaking(self):
         """After a table finishes, move its survivors to other tables.
@@ -1855,13 +1910,11 @@ class DealerBot:
             log.info("[T%d] table broken", tid)
 
         # Form final table when remaining players can all fit at one table AND
-        # we don't already have them all at a single running table
+        # we don't already have a single table (regardless of dead-seat bookkeeping
+        # inside that table's .agents list, which retains eliminated players).
         fits_one_table = len(all_alive) <= self._table_size
-        single_running = (
-            len(self.tables) == 1 and
-            all(len(t.agents) == len(all_alive) for t in self.tables.values())
-        )
-        if len(all_alive) >= 2 and fits_one_table and not single_running:
+        already_single = len(self.tables) == 1
+        if len(all_alive) >= 2 and fits_one_table and not already_single:
             # Graceful shutdown: flag tables to exit AFTER their current round
             # completes, not mid-hand (avoids losing all-in pots).
             for tid, t in self.tables.items():

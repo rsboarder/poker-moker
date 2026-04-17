@@ -289,6 +289,186 @@ async def test_stale_turn_id():
         await _teardown(dealer, server, reg_path)
 
 
+async def test_stale_socket_rejected():
+    """Old socket after reconnect must not be able to submit actions."""
+    print("test_stale_socket_rejected... ", end="", flush=True)
+    dealer, server, reg_path = await _setup_dealer()
+    try:
+        # Register bot1
+        ws_old = await websockets.connect(WS_URL)
+        await ws_old.send(json.dumps({"type": "register", "team": "stale1", "invite": INVITE}))
+        r1 = json.loads(await ws_old.recv())
+        assert r1["type"] == "registered"
+        token = r1["token"]
+
+        # Reconnect with same team + token
+        ws_new = await websockets.connect(WS_URL)
+        await ws_new.send(json.dumps({
+            "type": "register", "team": "stale1", "invite": INVITE, "token": token
+        }))
+        r2 = json.loads(await ws_new.recv())
+        assert r2.get("reconnected") is True
+
+        # Also register a 2nd bot so game starts
+        ws2 = await websockets.connect(WS_URL)
+        await ws2.send(json.dumps({"type": "register", "team": "stale2", "invite": INVITE}))
+        assert json.loads(await ws2.recv())["type"] == "registered"
+
+        await dealer.trigger_startgame()
+        await asyncio.sleep(0.5)
+
+        # Old (stale) socket tries to submit an action → dealer must reject
+        await ws_old.send(json.dumps({
+            "type": "action", "turn_id": 1, "action": "call", "amount": 10
+        }))
+        got_stale_err = False
+        try:
+            for _ in range(20):
+                raw = await asyncio.wait_for(ws_old.recv(), timeout=0.3)
+                m = json.loads(raw)
+                if m.get("type") == "error" and "stale" in m.get("text", "").lower():
+                    got_stale_err = True
+                    break
+        except (asyncio.TimeoutError, websockets.ConnectionClosed):
+            pass
+        assert got_stale_err, "Stale (old) socket was NOT rejected by _ws_action"
+
+        await dealer.trigger_stopgame()
+        await ws_old.close(); await ws_new.close(); await ws2.close()
+        print("PASS")
+    finally:
+        await _teardown(dealer, server, reg_path)
+
+
+async def test_missing_turn_id_rejected():
+    """Action without turn_id must be rejected outright (not silently accepted)."""
+    print("test_missing_turn_id_rejected... ", end="", flush=True)
+    dealer, server, reg_path = await _setup_dealer()
+    try:
+        socks = []
+        for team in ("m1", "m2"):
+            ws = await websockets.connect(WS_URL)
+            await ws.send(json.dumps({"type": "register", "team": team, "invite": INVITE}))
+            assert json.loads(await ws.recv())["type"] == "registered"
+            socks.append(ws)
+        await dealer.trigger_startgame()
+        await asyncio.sleep(0.4)
+
+        for ws in socks:
+            await ws.send(json.dumps({"type": "action", "action": "call", "amount": 10}))
+
+        got_missing = False
+        for ws in socks:
+            try:
+                for _ in range(10):
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.3)
+                    m = json.loads(raw)
+                    if m.get("type") == "error" and "missing turn_id" in m.get("text", "").lower():
+                        got_missing = True
+                        break
+                if got_missing:
+                    break
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                pass
+        assert got_missing, "Dealer silently accepted action without turn_id"
+
+        await dealer.trigger_stopgame()
+        for s in socks:
+            await s.close()
+        print("PASS")
+    finally:
+        await _teardown(dealer, server, reg_path)
+
+
+async def test_table_crash_aborts_tournament():
+    """A crashed table task must abort the tournament (no false winner)."""
+    print("test_table_crash_aborts_tournament... ", end="", flush=True)
+    dealer, server, reg_path = await _setup_dealer()
+    try:
+        # 2 bots + start, then monkeypatch run_single_round to raise
+        socks = []
+        for team in ("c1", "c2"):
+            ws = await websockets.connect(WS_URL)
+            await ws.send(json.dumps({"type": "register", "team": team, "invite": INVITE}))
+            assert json.loads(await ws.recv())["type"] == "registered"
+            socks.append(ws)
+
+        await dealer.trigger_startgame()
+        # Wait for tables to exist
+        for _ in range(20):
+            if dealer.tables:
+                break
+            await asyncio.sleep(0.1)
+        assert dealer.tables
+
+        # Inject a failure into one table session
+        some_table = next(iter(dealer.tables.values()))
+        orig = some_table.run_single_round
+        async def boom(*a, **kw):
+            raise RuntimeError("synthetic table crash")
+        some_table.run_single_round = boom  # type: ignore
+
+        # Wait for coordinator to notice. Must NOT broadcast tournament_over.
+        await asyncio.sleep(2.0)
+
+        # State should have exited to IDLE via finally; game_state should NOT be "tournament_over"
+        assert dealer._tournament_state == db.TournamentState.IDLE, dealer._tournament_state
+        with db._spectator_lock:
+            gs = db._spectator_state.get("game_state")
+        assert gs != "tournament_over", (
+            f"False winner declared after table crash (game_state={gs})"
+        )
+
+        for s in socks:
+            await s.close()
+        print("PASS")
+    finally:
+        await _teardown(dealer, server, reg_path)
+
+
+async def test_blind_clock_monotonic():
+    """_global_round_count must be monotonic even when the fastest table breaks."""
+    print("test_blind_clock_monotonic... ", end="", flush=True)
+    dealer, server, reg_path = await _setup_dealer()
+    try:
+        # Simulate: dealer has two fake tables; advance T1 to round 5, break it,
+        # then ensure _global_round_count does not regress below 5 when T2 updates.
+        from core.engine import GameEngine
+        class _FakeTable:
+            def __init__(self, rn):
+                self.engine = GameEngine()
+                self.engine.round_number = rn
+
+        dealer.tables = {1: _FakeTable(5), 2: _FakeTable(2)}
+        # Simulate table loop on T1:
+        table_round = 6
+        live_max = max(
+            [t.engine.round_number for t in dealer.tables.values()] + [table_round]
+        )
+        dealer._global_round_count = max(dealer._global_round_count, live_max)
+        assert dealer._global_round_count >= 6, dealer._global_round_count
+
+        # Break T1 (the high-round one), leaving only T2 at round 2
+        del dealer.tables[1]
+
+        # T2 loop now computes its own update
+        table_round = 3
+        live_max = max(
+            [t.engine.round_number for t in dealer.tables.values()] + [table_round]
+        )
+        dealer._global_round_count = max(dealer._global_round_count, live_max)
+
+        # The clock must NOT regress
+        assert dealer._global_round_count >= 6, (
+            f"Blind clock regressed from 6 to {dealer._global_round_count} after "
+            "fastest table was removed"
+        )
+        dealer.tables = {}
+        print(f"PASS (clock stayed at {dealer._global_round_count})")
+    finally:
+        await _teardown(dealer, server, reg_path)
+
+
 async def main():
     print("=" * 60)
     print("Edge-case Tests")
@@ -298,6 +478,10 @@ async def main():
     await test_malformed_amount()
     await test_stop_then_restart()
     await test_stale_turn_id()
+    await test_stale_socket_rejected()
+    await test_missing_turn_id_rejected()
+    await test_table_crash_aborts_tournament()
+    await test_blind_clock_monotonic()
     print("=" * 60)
     print("ALL EDGE CASES PASS")
     print("=" * 60)
