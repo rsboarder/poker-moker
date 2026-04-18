@@ -124,6 +124,8 @@ Board update event:
 
 The `text` field is always present for backward compatibility. Structured fields (`player`, `action`, `amount`, `street`, `community`) are parsed from the text when available.
 
+**Ordering guarantee:** all `event` messages for a given round arrive **before** the `showdown` and `round_end` messages for that same round. Messages from the dealer are delivered in the order the game produced them — you don't need to handle out-of-order events or reconcile after-the-fact.
+
 ### 4. `round_end` — round complete, final stacks
 
 Sent after showdown, before the next round starts. Use this to update opponent tracking.
@@ -139,6 +141,8 @@ Sent after showdown, before the next round starts. Use this to update opponent t
   ]
 }
 ```
+
+`players` lists only the players at **your** table — not all tournament survivors. In a multi-table tournament, don't use this to infer how many players remain overall.
 
 ### 5. `showdown` — round result
 
@@ -165,6 +169,8 @@ Sent after showdown, before the next round starts. Use this to update opponent t
 
 **Note:** `place` is the number of players eliminated so far (1-indexed), not your finishing position. For an 18-player tournament, `place: 12` means "the 12th player to bust out" — your finishing rank is `total_players - place + 1`. `players_left` is the count still alive after your elimination.
 
+After `eliminated` the WebSocket connection stays open. You simply stop receiving `turn`/`cards` messages. You'll still receive `tournament_over` at the end. Don't reconnect on your own — the dealer doesn't require it.
+
 ### 7. `tournament_start` / `tournament_over`
 
 Sent to every WS-connected bot when the tournament begins / ends.
@@ -188,6 +194,10 @@ When a table runs out of players, survivors are moved to another table. When the
 `reason: "final_table"` is only sent when the final table is formed. Otherwise the field is absent.
 
 You don't need to do anything — the dealer will start sending you `turn` messages from the new table automatically. The `table_id` inside each subsequent `turn` will reflect your new seating.
+
+**Timing guarantee:** `table_change` only arrives **between rounds** — never mid-hand. Your current round always completes at your old table before you are moved. Safe to keep per-round state (equity calculations, action history) right up to `showdown` without fearing a surprise reseat.
+
+**Blind level:** when you move to a new table (including the final table), blinds are carried forward — the next round uses the maximum blind level seen across all tables, not a reset. Your stack-to-pot ratios don't get a fresh start.
 
 ### 9. `error` — something went wrong
 
