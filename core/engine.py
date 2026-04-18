@@ -190,15 +190,16 @@ class GameEngine:
 
         elif action == "raise":
             max_street_bet = max(pl.street_bet for pl in self.players)
-            min_raise = max_street_bet + BIG_BLIND
+            min_raise = max_street_bet + self.big_blind
             total_needed = amount  # amount = total bet this street after raise
+            all_in_amount = p.stack + p.street_bet
 
-            if amount < min_raise:
-                return [GameEvent(type="error", data={
-                    "text": f"Raise must be at least {min_raise} total (min raise: +{self.big_blind})."
-                })]
-            if amount > p.stack + p.street_bet:
+            if amount > all_in_amount:
                 return [GameEvent(type="error", data={"text": "Not enough chips."})]
+            if amount < min_raise and amount != all_in_amount:
+                return [GameEvent(type="error", data={
+                    "text": f"Raise must be at least {min_raise} total, or all-in ({all_in_amount})."
+                })]
 
             added = amount - p.street_bet
             p.stack -= added
