@@ -303,7 +303,7 @@ def load_agents() -> list[AgentInfo]:
 
     # Legacy fallback — env vars
     agents = []
-    for i in range(1, 7):
+    for i in range(1, 13):
         username = os.getenv(f"AGENT_{i}_USERNAME")
         if not username:
             continue
@@ -674,31 +674,37 @@ class TableSession:
                     "status": p.status.value,
                 })
 
-            # Determine position for this player
-            # Standard 6-max: SB, BB, UTG, MP, CO, BTN
+            # Determine position for this player (supports 2–12 players)
             player_idx = next((i for i, p in enumerate(self.engine.players) if p.id == agent.player_id), 0)
             n = len(self.engine.players)
-            if n == 2:
-                # Heads-up: SB=BTN acts first preflop, BB acts first postflop
-                position = "SB" if player_idx == 0 else "BB"
-            elif n == 3:
-                position = ["SB", "BB", "BTN"][player_idx]
-            elif n == 4:
-                position = ["SB", "BB", "CO", "BTN"][player_idx]
-            elif n == 5:
-                position = ["SB", "BB", "UTG", "CO", "BTN"][player_idx]
+            _POSITIONS: dict[int, list[str]] = {
+                2:  ["SB", "BB"],
+                3:  ["SB", "BB", "BTN"],
+                4:  ["SB", "BB", "CO", "BTN"],
+                5:  ["SB", "BB", "UTG", "CO", "BTN"],
+                6:  ["SB", "BB", "UTG", "MP", "CO", "BTN"],
+                7:  ["SB", "BB", "UTG", "UTG+1", "MP", "CO", "BTN"],
+                8:  ["SB", "BB", "UTG", "UTG+1", "MP", "HJ", "CO", "BTN"],
+                9:  ["SB", "BB", "UTG", "UTG+1", "UTG+2", "MP", "HJ", "CO", "BTN"],
+                10: ["SB", "BB", "UTG", "UTG+1", "UTG+2", "MP", "MP+1", "HJ", "CO", "BTN"],
+                11: ["SB", "BB", "UTG", "UTG+1", "UTG+2", "MP", "MP+1", "MP+2", "HJ", "CO", "BTN"],
+                12: ["SB", "BB", "UTG", "UTG+1", "UTG+2", "MP", "MP+1", "MP+2", "MP+3", "HJ", "CO", "BTN"],
+            }
+            if n in _POSITIONS:
+                pos_list = _POSITIONS[n]
+                position = pos_list[player_idx] if player_idx < len(pos_list) else "MP"
             else:
-                # 6+: SB, BB, UTG, MP..., CO, BTN
+                # Fallback for n > 12: pin anchors, fill middle with MP
                 if player_idx == 0:
                     position = "SB"
                 elif player_idx == 1:
                     position = "BB"
-                elif player_idx == n - 1:
-                    position = "BTN"
-                elif player_idx == n - 2:
-                    position = "CO"
                 elif player_idx == 2:
                     position = "UTG"
+                elif player_idx == n - 2:
+                    position = "CO"
+                elif player_idx == n - 1:
+                    position = "BTN"
                 else:
                     position = "MP"
 

@@ -28,7 +28,7 @@ class TournamentDirector:
         agents: list[AgentInfo],
         bot: Bot,
         ws_connections: dict,
-        table_size: int = 6,
+        table_size: int = 12,
     ):
         self.all_agents = agents
         self.bot = bot
