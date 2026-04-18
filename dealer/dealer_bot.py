@@ -1086,6 +1086,7 @@ class DealerBot:
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
+                    log.warning("WS malformed JSON from user=%s: %r", username, raw[:200])
                     await ws.send(json.dumps({"type": "error", "text": "invalid JSON"}))
                     continue
 
@@ -1126,6 +1127,7 @@ class DealerBot:
         token = msg.get("token")  # for reconnect
 
         if not team:
+            log.warning("WS register rejected: missing team name (msg=%r)", msg)
             await ws.send(json.dumps({"type": "error", "text": "missing team name"}))
             return None
 
@@ -1147,11 +1149,14 @@ class DealerBot:
         data = _load_registrations_sync()
         expected_code = data.get("tournament_code", "") if data else ""
         if not expected_code or invite != expected_code:
+            log.warning("WS register rejected: team=%s invalid invite=%r (expected=%r)",
+                        team, invite, expected_code)
             await ws.send(json.dumps({"type": "error", "text": "invalid invite code"}))
             return None
 
         # Check for duplicate connection
         if username in self.ws_connections:
+            log.warning("WS register rejected: team=%s already connected", username)
             await ws.send(json.dumps({"type": "error", "text": f"{username} already connected"}))
             return None
 
@@ -1204,12 +1209,14 @@ class DealerBot:
         try:
             amount = int(raw_amount) if raw_amount is not None else 0
         except (ValueError, TypeError):
+            log.warning("WS invalid amount from user=%s: raw=%r action=%s", username, raw_amount, action)
             await ws.send(json.dumps({
                 "type": "error",
                 "text": f"invalid amount: {raw_amount!r} (must be integer)",
             }))
             return
         if action not in ("fold", "check", "call", "raise"):
+            log.warning("WS invalid action from user=%s: %r", username, action)
             await ws.send(json.dumps({"type": "error", "text": f"invalid action: {action}"}))
             return
 
@@ -1222,6 +1229,7 @@ class DealerBot:
         # Mandatory turn_id: reject missing / non-integer outright.
         raw_turn_id = msg.get("turn_id")
         if raw_turn_id is None:
+            log.warning("WS missing turn_id from user=%s action=%s amount=%s", username, action, amount)
             await ws.send(json.dumps({
                 "type": "error",
                 "text": "missing turn_id (every action MUST echo the turn's turn_id)",
@@ -1230,6 +1238,7 @@ class DealerBot:
         try:
             msg_turn_id = int(raw_turn_id)
         except (ValueError, TypeError):
+            log.warning("WS invalid turn_id from user=%s: raw=%r", username, raw_turn_id)
             await ws.send(json.dumps({
                 "type": "error",
                 "text": f"invalid turn_id: {raw_turn_id!r} (must be integer)",
@@ -1284,8 +1293,11 @@ class DealerBot:
 
         sb, bb = get_blinds(1)
         players_str = ", ".join(f"@{a.username}" for a in agents)
-        log.info("=== TOURNAMENT START: %d players (%s), %d table(s) of %d ===",
-                 len(agents), source, num_tables, table_size)
+        log.info("=== TOURNAMENT START: %d players (%s), %d table(s) of %d, blinds=%d/%d, stack=%d ===",
+                 len(agents), source, num_tables, table_size, sb, bb, STARTING_STACK)
+        for tid, table in self.tables.items():
+            log.info("  T%d roster: %s", tid,
+                     ", ".join(f"@{a.username}" for a in table.agents))
         await update.message.reply_text(
             f"🏆 AICollective AI Agents Poker — Tournament\n"
             f"Players: {players_str}\n"
@@ -1458,8 +1470,12 @@ class DealerBot:
     async def trigger_startgame(self) -> dict:
         ws_usernames = self._live_ws_usernames()
         if len(ws_usernames) < 2:
+            log.warning("HTTP /startgame rejected: only %d WS players connected (need 2+)",
+                        len(ws_usernames))
             return {"ok": False, "error": f"Need at least 2 players, {len(ws_usernames)} connected"}
         if self._is_game_active():
+            log.warning("HTTP /startgame rejected: tournament already in state=%s",
+                        self._tournament_state.value)
             return {"ok": False, "error": "Tournament already in progress"}
 
         self._tournament_state = TournamentState.STARTING
@@ -1467,8 +1483,11 @@ class DealerBot:
         table_size, num_tables = self._seat_and_init_tables(agents)
 
         sb, bb = get_blinds(1)
-        log.info("=== TOURNAMENT START via HTTP: %d players, %d table(s) of %d ===",
-                 len(agents), num_tables, table_size)
+        log.info("=== TOURNAMENT START via HTTP: %d players, %d table(s) of %d, blinds=%d/%d, stack=%d ===",
+                 len(agents), num_tables, table_size, sb, bb, STARTING_STACK)
+        for tid, table in self.tables.items():
+            log.info("  T%d roster: %s", tid,
+                     ", ".join(f"@{a.username}" for a in table.agents))
         self._tournament_state = TournamentState.RUNNING
         self._tournament_task = asyncio.create_task(self._run_tournament())
         return {
@@ -1481,7 +1500,10 @@ class DealerBot:
         }
 
     async def trigger_stopgame(self) -> dict:
-        log.info("=== TOURNAMENT STOPPED via HTTP ===")
+        log.info("=== TOURNAMENT STOPPED via HTTP: state=%s, tables=%d, alive=%d ===",
+                 self._tournament_state.value,
+                 len(self.tables),
+                 len([a for a in self._tournament_agents if a.stack > 0]))
         await self._reset_tournament_state()
         return {"ok": True}
 
@@ -1862,6 +1884,9 @@ class DealerBot:
                 self._global_round_count = max(self._global_round_count, live_max)
                 new_sb, new_bb = get_blinds(self._global_round_count)
                 if (new_sb, new_bb) != (table.engine.small_blind, table.engine.big_blind):
+                    log.info("[T%d] blind escalation: %d/%d → %d/%d (global_round=%d)",
+                             table_id, table.engine.small_blind, table.engine.big_blind,
+                             new_sb, new_bb, self._global_round_count)
                     table.engine.set_blinds(new_sb, new_bb)
 
                 n = len(active)
@@ -1875,7 +1900,9 @@ class DealerBot:
                 # tick so the coordinator sees authoritative state.
                 for p in table.engine.players:
                     agent = table._by_player_id.get(p.id)
-                    if agent:
+                    if agent and agent.stack != p.stack:
+                        log.info("[T%d] stack sync: @%s %d → %d",
+                                 table_id, agent.username, agent.stack, p.stack)
                         agent.stack = p.stack
 
                 # Signal the coordinator: a hand just finished WITH committed
@@ -1908,10 +1935,13 @@ class DealerBot:
         for a in agents:
             if a.stack == 0 and a.player_id not in self._eliminated_announced:
                 self._eliminated_announced.add(a.player_id)
+                place = len([x for x in agents if x.stack == 0])
+                log.info("Player eliminated: @%s (place=%d, players_left=%d)",
+                         a.username, place, len(all_alive))
                 await _send(self.bot, MAIN_GROUP_ID, f"💀 @{a.username} is eliminated!")
                 await self._send_to_player(a.username, {
                     "type": "eliminated",
-                    "place": len([x for x in agents if x.stack == 0]),
+                    "place": place,
                     "players_left": len(all_alive),
                 })
 
@@ -1996,7 +2026,9 @@ class DealerBot:
             for t in self.tables.values():
                 for p in t.engine.players:
                     agent = t._by_player_id.get(p.id)
-                    if agent:
+                    if agent and agent.stack != p.stack:
+                        log.info("[T%d] final-sync: @%s %d → %d",
+                                 t.table_id, agent.username, agent.stack, p.stack)
                         agent.stack = p.stack
             # Recompute alive list — survivors may have changed during the last hand
             all_alive = [a for a in agents if a.stack > 0]
@@ -2019,6 +2051,10 @@ class DealerBot:
             self.tables[final_tid] = final
 
             self._tournament_state = TournamentState.FINAL_TABLE
+            log.info("Final table formed: %d players (%s), blinds=%d/%d",
+                     len(all_alive),
+                     ", ".join(f"@{a.username}({a.stack})" for a in all_alive),
+                     *get_blinds(max(1, self._global_round_count)))
             await _send(self.bot, MAIN_GROUP_ID,
                         f"🎯 Final table! {len(all_alive)} players remaining")
             await self._broadcast_to_players(
