@@ -398,7 +398,15 @@ class TableSession:
                  self.table_id, self.engine.round_number, self.engine.state.value, len(events))
         await self._dispatch_events(events)
 
+        MAX_REJECTIONS_PER_TURN = 3
+        rejection_count = 0
+        last_pending = self._pending_player_id
+
         while self.engine.state not in (GameState.SHOWDOWN, GameState.WAITING):
+            if self._pending_player_id != last_pending:
+                rejection_count = 0
+                last_pending = self._pending_player_id
+
             pending_agent = self._by_player_id.get(self._pending_player_id)
             log.info("[T%d] Waiting for action. state=%s pending_player=%s",
                      self.table_id, self.engine.state.value,
@@ -425,6 +433,7 @@ class TableSession:
                                 f"⏱️ @{agent.username} timed out — auto-fold.")
                 with _spectator_lock:
                     _spectator_state["last_actions"][self._pending_player_id] = f"{action} (timeout)"
+                amount = 0
                 # Prevent runaway loop when multiple bots disconnect
                 await asyncio.sleep(0.5)
 
@@ -439,8 +448,28 @@ class TableSession:
 
             if len(events) == 1 and events[0].type == "error":
                 error_text = events[0].data.get("text", "Invalid action.")
-                log.warning("[T%d] Engine rejected action: %s", self.table_id, error_text)
+                rejection_count += 1
+                log.warning("[T%d] Engine rejected action (%d/%d): %s",
+                            self.table_id, rejection_count, MAX_REJECTIONS_PER_TURN, error_text)
                 await _send(self.bot, MAIN_GROUP_ID, f"❌ {error_text}")
+
+                if rejection_count >= MAX_REJECTIONS_PER_TURN:
+                    agent = self._by_player_id.get(self._pending_player_id)
+                    to_call = self.engine._to_call(self.engine.players[self.engine.current_idx])
+                    fallback_action = "check" if to_call == 0 else "fold"
+                    log.warning("[T%d] @%s exceeded %d rejections — force %s",
+                                self.table_id,
+                                agent.username if agent else "?",
+                                MAX_REJECTIONS_PER_TURN, fallback_action)
+                    await _send(self.bot, MAIN_GROUP_ID,
+                                f"🚫 @{agent.username if agent else '?'} — too many invalid actions, forced {fallback_action}.")
+                    forced = self.engine.apply_action(self._pending_player_id, fallback_action, 0)
+                    with _spectator_lock:
+                        _spectator_state["last_actions"][self._pending_player_id] = f"{fallback_action} (forced)"
+                    await self._dispatch_events(forced)
+                    rejection_count = 0
+                    continue
+
                 agent = self._by_player_id.get(self._pending_player_id)
                 if agent:
                     p = self.engine.players[self.engine.current_idx]
@@ -619,12 +648,20 @@ class TableSession:
             to_call = self.engine._to_call(player) if player else 0
             max_bet = max(p.street_bet for p in self.engine.players)
             min_raise = max_bet + self.engine.big_blind
+            player_total = (player.stack + player.street_bet) if player else 0
+            can_raise_full = player_total >= min_raise
+            can_all_in = player_total > max_bet
 
             valid_actions = []
             if to_call > 0:
-                valid_actions = [f"fold", f"call {to_call}", f"raise {min_raise}-{player.stack + player.street_bet}"]
+                valid_actions.append("fold")
+                valid_actions.append(f"call {to_call}")
             else:
-                valid_actions = [f"check", f"raise {min_raise}-{player.stack + player.street_bet}"]
+                valid_actions.append("check")
+            if can_raise_full:
+                valid_actions.append(f"raise {min_raise}-{player_total}")
+            elif can_all_in:
+                valid_actions.append(f"raise {player_total} (all-in)")
 
             # Build players list with stacks and status
             players_info = []
